@@ -330,6 +330,62 @@ func TestHandlerServesHealthz(t *testing.T) {
 	}
 }
 
+// TestHealthzIsReachableFromAnUnlistedAddress is the direct proof of the
+// health-endpoint's deliberate exemption from the origin gate: an
+// address that appears nowhere in the connector allowlist can still
+// reach /healthz — a liveness probe does not run from a connector
+// address (see Handler). The request must still show up in the access
+// log (checked here too): the exemption is from the origin gate, not
+// from being recorded.
+func TestHealthzIsReachableFromAnUnlistedAddress(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	h := newServer(t, idp, &logs)
+
+	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	r.RemoteAddr = "172.20.0.5:5000"
+	r.Header.Set("X-Forwarded-For", "203.0.113.9") // nowhere in the allowlist
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d — an unlisted address must still reach /healthz", w.Code, http.StatusOK)
+	}
+	// Nothing but reachability: no version, no configuration, no
+	// counters — anything more here would be a second, silent way for
+	// this deliberately open endpoint to leak information to an address
+	// the origin gate would otherwise have kept out entirely.
+	if w.Body.String() != "ok" {
+		t.Errorf("body = %q, want exactly %q", w.Body.String(), "ok")
+	}
+	if !strings.Contains(logs.String(), `"GET /healthz HTTP/1.1" 200`) {
+		t.Errorf("access log %q does not record the health check", logs.String())
+	}
+}
+
+// TestMCPStillRejectsTheSameUnlistedAddress is the more important half
+// of the health-endpoint exception's proof: the exact address that just
+// reached /healthz above must still be refused by /mcp. Without this
+// test, a change that accidentally widened the exemption — moving
+// /healthz's bypass up a level, say, so it covered the whole mux instead
+// of one path — would look identical to the intended fix: /healthz
+// still returns 200. This is what would actually catch it.
+func TestMCPStillRejectsTheSameUnlistedAddress(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	h := newServer(t, idp, &logs)
+
+	token := idp.Token(map[string]any{
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-123",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+
+	w := request(t, h, "172.20.0.5:5000", "203.0.113.9", token)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d — the health-endpoint exception must not extend to /mcp, even with a valid token", w.Code, http.StatusForbidden)
+	}
+}
+
 func TestHandlerWithoutAttachedMCPHandlerHasNoMCPRoute(t *testing.T) {
 	idp := testidp.New(t)
 	var logs syncBuffer
@@ -923,19 +979,25 @@ func TestLogWriterNeedNotBeConcurrencySafe(t *testing.T) {
 	for i := range n {
 		go func(refused bool) {
 			defer wg.Done()
-			req, err := http.NewRequest(http.MethodGet, ts.URL+"/healthz", nil)
+			// /healthz bypasses the origin gate entirely (see Handler),
+			// so it can no longer exercise the OnReject write path —
+			// target /mcp for the refused half instead, which stays
+			// behind the gate.
+			target := ts.URL + "/healthz"
+			if refused {
+				target = ts.URL + "/mcp"
+			}
+			req, err := http.NewRequest(http.MethodGet, target, nil)
 			if err != nil {
 				t.Error(err)
 				return
 			}
 			// The peer (127.0.0.1) is a trusted proxy, so the forwarded
-			// address decides whether the origin gate lets the request
-			// through — independent of the loopback peer every request
-			// in this test actually arrives from.
+			// address decides whether the origin gate lets the /mcp
+			// request through — independent of the loopback peer every
+			// request in this test actually arrives from.
 			if refused {
 				req.Header.Set("X-Forwarded-For", "203.0.113.9")
-			} else {
-				req.Header.Set("X-Forwarded-For", "160.79.104.1")
 			}
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {

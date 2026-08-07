@@ -297,26 +297,29 @@ func (s *Server) toolMiddleware() mcp.Middleware {
 //
 // Order matters and is the point of this function:
 //
-//	access log        outermost, so refusals are recorded too
-//	  origin gate     before the body is read
-//	    authenticate  before the MCP layer sees anything — but only for
-//	                  /mcp; /healthz and the RFC 9728 metadata document
-//	                  are reachable without a token (the latter
-//	                  deliberately: see the route registration below)
-//	      MCP handler tool authorization lives inside, in SDK middleware
-//	                  installed by AttachMCP (see toolMiddleware)
+//	access log        outermost, so every request is recorded — health
+//	                  checks and refusals alike
+//	  /healthz        exempt from the origin gate (see the route
+//	                  registration below); every other path continues
+//	                  through it
+//	    origin gate   before the body is read
+//	      authenticate before the MCP layer sees anything — but only for
+//	                  /mcp; the RFC 9728 metadata document is reachable
+//	                  without a token too (deliberately: see its route
+//	                  registration below), though still behind the
+//	                  origin gate, unlike /healthz
+//	        MCP handler tool authorization lives inside, in SDK
+//	                  middleware installed by AttachMCP (see
+//	                  toolMiddleware)
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
 	// Deliberately not behind authenticate: this is the document a
 	// connector fetches in response to the WWW-Authenticate challenge
 	// (see challenge), before it has a token — gating it would mean the
 	// pointer a 401 hands out itself resolves to a 401, a loop with no
 	// way out for a connector that only knows to follow the standard
-	// discovery flow.
+	// discovery flow. Still behind the origin gate below: reaching it
+	// requires a connector address, the same as reaching /mcp does.
 	mux.Handle(wellKnownProtectedResourcePath, auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
 		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/"),
 		AuthorizationServers:   []string{s.cfg.IssuerURL},
@@ -344,7 +347,32 @@ func (s *Server) Handler() http.Handler {
 		},
 	})
 
-	return accesslog.Middleware(s.logs)(gate(mux))
+	top := http.NewServeMux()
+	// Deliberately exempt from the origin gate — not an oversight, and
+	// not the same exemption /.well-known/oauth-protected-resource
+	// gets above (that one still requires a connector address; this one
+	// requires none at all). A liveness or readiness probe — a
+	// container orchestrator, a load balancer health check — runs from
+	// an address that will never appear in a connector allowlist.
+	// Gating this endpoint the same way as /mcp risks a worse failure
+	// than the gate exists to prevent: the reflex fix for a failing
+	// health check is to add the prober's own address to
+	// GANGWAY_ALLOWED_PREFIXES, and one list governs both endpoints —
+	// so that reflex quietly turns the origin gate on /mcp into a
+	// formality, with nothing visibly broken to reveal it. The
+	// response gives away nothing but reachability: no version, no
+	// configuration, no counters, just "ok" — anyone who can reach the
+	// port learns nothing they will not learn from the TCP handshake
+	// itself. If you are reading this while making /healthz go through
+	// the gate like everything else, that was already considered and
+	// rejected — read the reasoning above first.
+	top.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	top.Handle("/", gate(mux))
+
+	return accesslog.Middleware(s.logs)(top)
 }
 
 // authenticate verifies the bearer token and places the identity in the
