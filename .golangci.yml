@@ -1,0 +1,15 @@
+version: "2"
+
+# golangci-lint's built-in "standard" set already covers errcheck, govet,
+# ineffassign, staticcheck and unused. revive is added explicitly for style
+# and naming conventions. Deliberately no additional linters beyond this —
+# a lean baseline that won't turn the first CI run red with style nitpicks.
+linters:
+  default: standard
+  enable:
+    - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
