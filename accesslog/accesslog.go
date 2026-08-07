@@ -8,9 +8,54 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
+
+const hexDigits = "0123456789ABCDEF"
+
+// mustEscape reports whether b needs escaping to safely appear inside a
+// double-quoted field of the log line: NGINX's default log_format escapes
+// the same set — the quote and backslash themselves, plus control bytes
+// and anything outside printable ASCII.
+func mustEscape(b byte) bool {
+	return b == '"' || b == '\\' || b < 0x20 || b > 0x7e
+}
+
+// escapeField escapes a request-controlled value the way NGINX's default
+// log_format escaping does (`\xXX` for each byte that needs it). Referer
+// and User-Agent come straight from the client; without this, a value
+// containing a double quote closes the field early and lets the rest of
+// the header be read as forged, additional log fields — e.g. a fabricated
+// mcp_outcome="allowed" appended by the attacker rather than by this
+// package.
+func escapeField(s string) string {
+	escapeCount := 0
+	for i := 0; i < len(s); i++ {
+		if mustEscape(s[i]) {
+			escapeCount++
+		}
+	}
+	if escapeCount == 0 {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + escapeCount*3)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if mustEscape(c) {
+			b.WriteByte('\\')
+			b.WriteByte('x')
+			b.WriteByte(hexDigits[c>>4])
+			b.WriteByte(hexDigits[c&0x0f])
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
 
 type outcome struct {
 	mu      sync.Mutex
@@ -102,7 +147,7 @@ func Middleware(out io.Writer) func(http.Handler) http.Handler {
 				start.Format("02/Jan/2006:15:04:05 -0700"),
 				r.Method, r.URL.RequestURI(), r.Proto,
 				rec.status, rec.bytes,
-				r.Referer(), r.UserAgent(),
+				escapeField(r.Referer()), escapeField(r.UserAgent()),
 			)
 
 			o.mu.Lock()

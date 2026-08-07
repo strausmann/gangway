@@ -135,6 +135,146 @@ func TestHandlesMalformedRemoteAddr(t *testing.T) {
 	}
 }
 
+func TestRecordsUnauthorizedStatusCode(t *testing.T) {
+	var buf bytes.Buffer
+
+	// A denied credential check answers with a real HTTP status — this is
+	// the case log analysis relies on most: distinguishing a scan of
+	// rejected credentials from a burst of legitimate traffic.
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("unauthorized"))
+	}))
+
+	r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if !strings.Contains(line, `" 401 `) {
+		t.Errorf("expected HTTP status 401 in %q", line)
+	}
+	if strings.Contains(line, `" 200 `) {
+		t.Errorf("log line %q must not also report 200 for a 401 response", line)
+	}
+}
+
+func TestRecordsForbiddenStatusCodeWithoutBody(t *testing.T) {
+	var buf bytes.Buffer
+
+	// WriteHeader without a following Write call: the status must still
+	// be the one actually set, not silently reset to the 200 default.
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+
+	r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if !strings.Contains(line, `" 403 0`) {
+		t.Errorf("expected HTTP status 403 and 0 bytes in %q", line)
+	}
+	if strings.Contains(line, `" 200 `) {
+		t.Errorf("log line %q must not also report 200 for a 403 response", line)
+	}
+}
+
+func TestEscapesDoubleQuoteInUserAgent(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	// A raw quote here would close the quoted user-agent field early and
+	// let the rest of the value be read as forged extra log fields —
+	// e.g. a fabricated mcp_outcome="allowed".
+	r.Header.Set("User-Agent", `evil" mcp_outcome="allowed`)
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if strings.Contains(line, `evil" mcp_outcome="allowed`) {
+		t.Errorf("log line %q contains an unescaped double quote from the user agent", line)
+	}
+	if !strings.Contains(line, `evil\x22 mcp_outcome=\x22allowed`) {
+		t.Errorf("log line %q does not contain the NGINX-style escaped quote (\\x22): %q", line, line)
+	}
+	// The escaped line must still open and close exactly two quoted
+	// fields (request line + referer + user-agent = 3 quoted fields,
+	// each opened and closed once): an even, expected quote count proves
+	// no field boundary was forged.
+	if n := strings.Count(line, `"`); n != 6 {
+		t.Errorf("expected exactly 6 literal quote characters (3 quoted fields) in %q, got %d", line, n)
+	}
+}
+
+func TestEscapesBackslashInReferer(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	r.Header.Set("Referer", `https://example.com/a\b`)
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if strings.Contains(line, `a\b`) {
+		t.Errorf("log line %q contains an unescaped backslash from the referer", line)
+	}
+	if !strings.Contains(line, `a\x5Cb`) {
+		t.Errorf("log line %q does not contain the NGINX-style escaped backslash (\\x5C): %q", line, line)
+	}
+}
+
+func TestEscapesControlCharacterInUserAgent(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	// net/http header values cannot carry a raw CR/LF, but any other
+	// control byte must still be escaped rather than passed through raw
+	// — a raw newline here would forge an additional log line.
+	r.Header.Set("User-Agent", "before\x01after")
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if strings.Contains(line, "\x01") {
+		t.Errorf("log line %q contains a raw control byte from the user agent", line)
+	}
+	if !strings.Contains(line, `before\x01after`) {
+		t.Errorf("log line %q does not contain the NGINX-style escaped control byte (\\x01): %q", line, line)
+	}
+}
+
+func TestPassesThroughOrdinaryUserAgentUnescaped(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	r.Header.Set("User-Agent", "claude-connector/1.0 (+https://example.com)")
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if !strings.Contains(line, `"claude-connector/1.0 (+https://example.com)"`) {
+		t.Errorf("log line %q should pass an ordinary user agent through unescaped", line)
+	}
+}
+
 // flushRecorder wraps httptest.ResponseRecorder to observe whether Flush
 // was forwarded through the middleware. httptest.ResponseRecorder already
 // implements http.Flusher, but we need our own counter to prove the call
