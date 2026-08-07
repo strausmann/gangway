@@ -15,7 +15,7 @@ jobs:
       - run: go build ./...
       - run: go test -race -coverprofile=cover.out ./...
       - name: coverage gate
-        run: ./scripts/coverage-gate.sh --require-all cover.out identity:90 origin:90 access:90 backend:85 accesslog:85
+        run: ./scripts/coverage-gate.sh --require-all cover.out identity:90 origin:90 access:90 backend:85 accesslog:85 serve:90
   lint:
     runs-on: ubuntu-latest
     steps:
