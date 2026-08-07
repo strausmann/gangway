@@ -275,6 +275,39 @@ func TestPassesThroughOrdinaryUserAgentUnescaped(t *testing.T) {
 	}
 }
 
+func TestEscapesDoubleQuoteInRequestLine(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// The Go HTTP server itself re-escapes a raw double quote in the path
+	// portion of the request line before it ever reaches Middleware (see
+	// url.URL.EscapedPath). The query portion is not re-escaped that way,
+	// though — net/url.Parse stores RawQuery verbatim, so this is a real,
+	// reachable path for a raw double quote to arrive here, not merely a
+	// hypothetical one.
+	r := httptest.NewRequest(http.MethodGet, `/mcp?x="y`, nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if strings.Contains(line, `?x="y`) {
+		t.Errorf("log line %q contains an unescaped double quote from the request line", line)
+	}
+	if !strings.Contains(line, `?x=\x22y`) {
+		t.Errorf("log line %q does not contain the NGINX-style escaped quote (\\x22) for the request line: %q", line, line)
+	}
+	// Exactly one quoted field for the request line itself (referer and
+	// user-agent are both empty in this test but still contribute their
+	// own pair of quotes): 3 quoted fields, 6 literal quote characters.
+	// An injected raw quote would add two more.
+	if n := strings.Count(line, `"`); n != 6 {
+		t.Errorf("expected exactly 6 literal quote characters (3 quoted fields) in %q, got %d", line, n)
+	}
+}
+
 // flushRecorder wraps httptest.ResponseRecorder to observe whether Flush
 // was forwarded through the middleware. httptest.ResponseRecorder already
 // implements http.Flusher, but we need our own counter to prove the call

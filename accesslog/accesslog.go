@@ -24,12 +24,24 @@ func mustEscape(b byte) bool {
 }
 
 // escapeField escapes a request-controlled value the way NGINX's default
-// log_format escaping does (`\xXX` for each byte that needs it). Referer
-// and User-Agent come straight from the client; without this, a value
-// containing a double quote closes the field early and lets the rest of
-// the header be read as forged, additional log fields — e.g. a fabricated
-// mcp_outcome="allowed" appended by the attacker rather than by this
-// package.
+// log_format escaping does (`\xXX` for each byte that needs it). Applied
+// to every field built from client input — method, request line, proto,
+// referer, and user-agent — because without it, a value containing a
+// double quote closes the field early and lets the rest be read as
+// forged, additional log fields — e.g. a fabricated mcp_outcome="allowed"
+// appended by the attacker rather than by this package.
+//
+// The request line's query string is the field most worth escaping: Go's
+// net/http re-escapes a raw double quote in the path portion before
+// Middleware ever sees it (see url.URL.EscapedPath), but the query
+// portion is stored and reproduced verbatim, so a request like
+// "/mcp?x=\"y" reaches here with the quote intact. The method and proto
+// fields, by contrast, cannot carry one through a real net/http server —
+// ReadRequest rejects a method containing '"' outright, and proto is
+// parsed against a strict "HTTP/x.y" pattern — so escaping them is
+// defense in depth against a caller that builds *http.Request by hand
+// (a custom front end, or a test) rather than a gap seen through the
+// standard server.
 func escapeField(s string) string {
 	escapeCount := 0
 	for i := 0; i < len(s); i++ {
@@ -145,7 +157,7 @@ func Middleware(out io.Writer) func(http.Handler) http.Handler {
 			line := fmt.Sprintf(`%s - - [%s] "%s %s %s" %d %d "%s" "%s"`,
 				host,
 				start.Format("02/Jan/2006:15:04:05 -0700"),
-				r.Method, r.URL.RequestURI(), r.Proto,
+				escapeField(r.Method), escapeField(r.URL.RequestURI()), escapeField(r.Proto),
 				rec.status, rec.bytes,
 				escapeField(r.Referer()), escapeField(r.UserAgent()),
 			)
