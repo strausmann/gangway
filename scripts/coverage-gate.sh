@@ -2,6 +2,21 @@
 set -euo pipefail
 
 profile="$1"; shift
+
+# Read the profile once, and fail hard if it cannot be read at all. An
+# unreadable or empty profile must never be mistaken for "package does not
+# exist yet" — that would let the gate pass green on the very packages it
+# is meant to guard.
+if ! funcs=$(go tool cover -func="$profile" 2>&1); then
+  echo "FAIL: cannot read coverage profile $profile" >&2
+  printf '%s\n' "$funcs" >&2
+  exit 1
+fi
+if [ -z "$funcs" ]; then
+  echo "FAIL: coverage profile $profile is empty" >&2
+  exit 1
+fi
+
 fail=0
 checked=0
 total=0
@@ -11,11 +26,11 @@ for spec in "$@"; do
   want="${spec##*:}"
   total=$((total + 1))
 
-  # A package that does not exist yet is not a failure — it is reported and
-  # skipped. The summary below makes an unexpected skip visible.
-  lines=$(go tool cover -func="$profile" | grep "/$pkg/" || true)
+  # Now this really only means "not in the profile" — the profile itself
+  # is known good.
+  lines=$(printf '%s\n' "$funcs" | grep "/$pkg/" || true)
   if [ -z "$lines" ]; then
-    echo "$pkg: no coverage data — skipped"
+    echo "$pkg: not present in profile — skipped"
     continue
   fi
 

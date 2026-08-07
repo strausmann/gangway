@@ -4,5 +4,16 @@
   "packageRules": [
     { "matchManagers": ["gomod"], "groupName": "go modules" },
     { "matchManagers": ["github-actions"], "groupName": "github actions" }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["^\\.github/workflows/ci\\.yml$"],
+      "matchStrings": [
+        "golangci-lint-action@\\S+\\s+with:\\s+version:\\s+(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "golangci/golangci-lint",
+      "datasourceTemplate": "github-releases"
+    }
   ]
 }
