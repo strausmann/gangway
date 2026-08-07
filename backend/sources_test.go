@@ -122,6 +122,47 @@ func TestExchangeErrorNeverLeaksResponseBody(t *testing.T) {
 	}
 }
 
+// TestExchangeErrorNeverLeaksTokenURL guards the same class of leak as
+// TestExchangeErrorNeverLeaksResponseBody, but for ExchangeConfig.TokenURL
+// itself: it is caller-supplied and might be a signed URL or carry a
+// credential in its path or query. Both http.NewRequestWithContext and
+// http.Client.Do wrap their errors in *url.Error, whose own Error() text
+// echoes the full URL back verbatim — so both failure paths need covering,
+// not just one.
+func TestExchangeErrorNeverLeaksTokenURL(t *testing.T) {
+	const secret = "leaked-super-secret-token-must-never-appear-in-a-log"
+
+	assertNoLeak := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error leaked the token URL's path/query: %v", err)
+		}
+	}
+
+	t.Run("invalid URL", func(t *testing.T) {
+		// A control character makes the URL unparsable — the
+		// request-construction error path, before any request is sent.
+		src := backend.Exchange(backend.ExchangeConfig{
+			TokenURL: "http://exchange.example/" + secret + "\n", ClientID: "gangway",
+		})
+		_, err := src.TokenFor(context.Background(), caller, "incoming")
+		assertNoLeak(t, err)
+	})
+
+	t.Run("server unreachable", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		tokenURL := srv.URL + "/" + secret + "?token=" + secret
+		srv.Close() // nothing is listening at this address anymore
+
+		src := backend.Exchange(backend.ExchangeConfig{TokenURL: tokenURL, ClientID: "gangway"})
+		_, err := src.TokenFor(context.Background(), caller, "incoming")
+		assertNoLeak(t, err)
+	})
+}
+
 func TestExchangeNetworkError(t *testing.T) {
 	// A server that is closed before the request is made guarantees a
 	// transport-level failure (connection refused) rather than an HTTP

@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -93,13 +94,19 @@ func (e *exchange) TokenFor(ctx context.Context, _ *identity.Identity, incoming 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.cfg.TokenURL,
 		strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		// http.NewRequestWithContext wraps a malformed URL in a *url.Error
+		// whose own Error() text echoes it back verbatim — path, query and
+		// all. withoutURL strips that layer; hostOnly names only the host
+		// in the message we build ourselves.
+		return "", fmt.Errorf("gangway: build token exchange request for %s: %w", hostOnly(e.cfg.TokenURL), withoutURL(err))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := e.cfg.Client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("gangway: token exchange: %w", err)
+		// Same *url.Error wrapping as above, this time from the transport
+		// (e.g. a dial failure) rather than URL parsing.
+		return "", fmt.Errorf("gangway: token exchange with %s: %w", hostOnly(e.cfg.TokenURL), withoutURL(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -122,4 +129,28 @@ func (e *exchange) TokenFor(ctx context.Context, _ *identity.Identity, incoming 
 		return "", fmt.Errorf("gangway: token exchange returned no access token")
 	}
 	return out.AccessToken, nil
+}
+
+// hostOnly reduces a URL to scheme and host, for error messages: enough to
+// identify which provider a request failed against, without repeating a
+// path or query string that might carry a signed URL or an embedded
+// credential.
+func hostOnly(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return "(unparsable URL)"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// withoutURL strips the *url.Error wrapper that net/http adds around both
+// request-construction and transport failures. Its own Error() text embeds
+// the full request URL — including any path or query that might carry a
+// signed URL or an embedded credential — but the cause it wraps does not.
+func withoutURL(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Err
+	}
+	return err
 }
