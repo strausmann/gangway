@@ -10,9 +10,11 @@ import (
 	"errors"
 )
 
-// ErrUnauthenticated is returned for every rejected token. The reason is
-// deliberately not exposed to callers — it belongs in logs, not in
-// responses.
+// ErrUnauthenticated is returned for every rejected token, wrapping the
+// underlying reason (errors.Is still matches). That reason is for logs
+// and debugging: a caller of Verify sees it in the returned error, but it
+// must never be forwarded into a response sent back over the network —
+// callers there get a fixed, generic message instead.
 var ErrUnauthenticated = errors.New("gangway: unauthenticated")
 
 // Identity is a verified caller.
