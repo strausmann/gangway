@@ -73,15 +73,21 @@ func NewOIDC(ctx context.Context, cfg OIDCConfig) (Verifier, error) {
 		subjectClaim: cfg.SubjectClaim,
 	}
 
-	if cfg.KeyRefreshInterval >= 0 {
-		interval := cfg.KeyRefreshInterval
-		if interval == 0 {
-			interval = defaultKeyRefreshInterval
-		}
+	if interval := resolveRefreshInterval(cfg.KeyRefreshInterval); interval > 0 {
 		go v.refreshKeys(ctx, cfg, interval)
 	}
 
 	return v, nil
+}
+
+// resolveRefreshInterval maps the configured value onto the effective one:
+// zero means "unset" and gets the default, a negative value disables
+// refreshing entirely, anything else is taken as given.
+func resolveRefreshInterval(d time.Duration) time.Duration {
+	if d == 0 {
+		return defaultKeyRefreshInterval
+	}
+	return d
 }
 
 // refreshKeys periodically rediscovers the issuer and swaps in a verifier
