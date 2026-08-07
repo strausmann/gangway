@@ -20,9 +20,10 @@ import (
 type IDP struct {
 	srv *httptest.Server
 
-	mu    sync.RWMutex
-	key   *rsa.PrivateKey
-	keyID string
+	mu          sync.RWMutex
+	key         *rsa.PrivateKey
+	keyID       string
+	unavailable bool
 }
 
 // New starts a test issuer and registers cleanup with t.
@@ -58,7 +59,27 @@ func (i *IDP) Rotate() { i.newKey() }
 
 func (i *IDP) URL() string { return i.srv.URL }
 
+// SetUnavailable makes both the discovery and keys endpoints respond with
+// 503 Service Unavailable while true, simulating a transient outage at the
+// identity provider. Used to test that a verifier's background key refresh
+// tolerates a failed rediscovery attempt instead of being disturbed by it.
+func (i *IDP) SetUnavailable(unavailable bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.unavailable = unavailable
+}
+
+func (i *IDP) isUnavailable() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.unavailable
+}
+
 func (i *IDP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
+	if i.isUnavailable() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"issuer":                                i.srv.URL,
@@ -68,6 +89,11 @@ func (i *IDP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (i *IDP) handleKeys(w http.ResponseWriter, _ *http.Request) {
+	if i.isUnavailable() {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 

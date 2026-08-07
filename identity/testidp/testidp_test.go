@@ -44,6 +44,41 @@ func TestRotateChangesKeyID(t *testing.T) {
 	}
 }
 
+func TestSetUnavailableFailsRequestsUntilCleared(t *testing.T) {
+	idp := testidp.New(t)
+
+	idp.SetUnavailable(true)
+
+	resp, err := http.Get(idp.URL() + "/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatalf("get discovery: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("discovery status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	resp, err = http.Get(idp.URL() + "/keys")
+	if err != nil {
+		t.Fatalf("get keys: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("keys status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	idp.SetUnavailable(false)
+
+	resp, err = http.Get(idp.URL() + "/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatalf("get discovery after recovery: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("discovery status after recovery = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
 func fetchKeyID(t *testing.T, base string) string {
 	t.Helper()
 	resp, err := http.Get(base + "/keys")

@@ -174,6 +174,55 @@ func TestRejectsAfterKeyRotation(t *testing.T) {
 	}
 }
 
+// TestRecoversAfterProviderOutage exercises the failure branch of the
+// background key-refresh loop directly: a rediscovery attempt that fails
+// while the issuer is briefly unreachable must not disturb the verifier
+// currently in use, and refreshing must resume once the issuer is reachable
+// again. If a failed attempt instead cleared the verifier, or if the
+// refresh loop gave up retrying after one failure, a transient hiccup at
+// the identity provider would silently and permanently break verification
+// for the lifetime of the process — exactly the outage the refreshKeys
+// retry-on-error branch exists to prevent.
+func TestRecoversAfterProviderOutage(t *testing.T) {
+	idp := testidp.New(t)
+	v := newVerifierWithConfig(t, identity.OIDCConfig{
+		IssuerURL:          idp.URL(),
+		Audience:           "test-audience",
+		SubjectClaim:       "sub",
+		KeyRefreshInterval: 20 * time.Millisecond,
+	})
+
+	token := idp.Token(validClaims(idp))
+	if _, err := v.Verify(context.Background(), token); err != nil {
+		t.Fatalf("Verify (before outage): %v", err)
+	}
+
+	idp.SetUnavailable(true)
+	// There is no externally observable signal for "a refresh attempt just
+	// failed" (that's the point: it must be invisible to callers), so this
+	// waits out several refresh intervals to let multiple attempts fail
+	// before asserting the verifier survived them.
+	time.Sleep(5 * 20 * time.Millisecond)
+
+	if _, err := v.Verify(context.Background(), token); err != nil {
+		t.Fatalf("Verify (during outage): a failed refresh attempt disturbed the existing verifier: %v", err)
+	}
+
+	idp.SetUnavailable(false)
+	idp.Rotate()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := v.Verify(context.Background(), token); err != nil {
+			return // the refresh loop recovered and picked up the new key set
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresh loop did not recover after the provider outage ended")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestKeyRefreshCanBeDisabled documents and covers the escape hatch: a
 // negative KeyRefreshInterval disables the background refresh loop
 // entirely. This is the opposite of the security property under test
