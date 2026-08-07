@@ -79,6 +79,34 @@ func TestSetUnavailableFailsRequestsUntilCleared(t *testing.T) {
 	}
 }
 
+func TestDiscoveryRequestsCountsRejectedRequestsToo(t *testing.T) {
+	idp := testidp.New(t)
+
+	if got := idp.DiscoveryRequests(); got != 0 {
+		t.Fatalf("DiscoveryRequests() before any request = %d, want 0", got)
+	}
+
+	get := func(t *testing.T) {
+		t.Helper()
+		resp, err := http.Get(idp.URL() + "/.well-known/openid-configuration")
+		if err != nil {
+			t.Fatalf("get discovery: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	get(t)
+	if got := idp.DiscoveryRequests(); got != 1 {
+		t.Errorf("DiscoveryRequests() after one request = %d, want 1", got)
+	}
+
+	idp.SetUnavailable(true)
+	get(t)
+	if got := idp.DiscoveryRequests(); got != 2 {
+		t.Errorf("DiscoveryRequests() after a rejected request = %d, want 2 (rejected requests must still count)", got)
+	}
+}
+
 func fetchKeyID(t *testing.T, base string) string {
 	t.Helper()
 	resp, err := http.Get(base + "/keys")

@@ -20,10 +20,11 @@ import (
 type IDP struct {
 	srv *httptest.Server
 
-	mu          sync.RWMutex
-	key         *rsa.PrivateKey
-	keyID       string
-	unavailable bool
+	mu                sync.RWMutex
+	key               *rsa.PrivateKey
+	keyID             string
+	unavailable       bool
+	discoveryRequests int
 }
 
 // New starts a test issuer and registers cleanup with t.
@@ -69,6 +70,19 @@ func (i *IDP) SetUnavailable(unavailable bool) {
 	i.unavailable = unavailable
 }
 
+// DiscoveryRequests returns how many times the discovery endpoint has been
+// hit, including requests rejected while SetUnavailable(true) was in
+// effect. A verifier's periodic key refresh (oidc.NewProvider) only ever
+// calls the discovery endpoint — it does not eagerly fetch the keys
+// endpoint, that only happens lazily on the next Verify() call — so this,
+// not a keys-endpoint counter, is what makes a refresh attempt (successful
+// or failed) observable from a test.
+func (i *IDP) DiscoveryRequests() int {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.discoveryRequests
+}
+
 func (i *IDP) isUnavailable() bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -76,6 +90,10 @@ func (i *IDP) isUnavailable() bool {
 }
 
 func (i *IDP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
+	i.mu.Lock()
+	i.discoveryRequests++
+	i.mu.Unlock()
+
 	if i.isUnavailable() {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return

@@ -135,19 +135,30 @@ func TestRejectsUnknownKeyID(t *testing.T) {
 // experiment: without OIDCConfig.KeyRefreshInterval driving a periodic
 // rediscovery, this exact sequence keeps accepting the retired-key token.
 //
-// A very short KeyRefreshInterval is configured here so the background
-// refresh loop rediscovers the issuer (and therefore drops the retired key)
-// within the test's lifetime. The retry loop below has no fixed sleep
-// before asserting rejection, because the refresh happens on a ticker in a
-// separate goroutine — asserting immediately would be racy, and a fixed
-// sleep would make the test slow or flaky depending on scheduling.
+// A short KeyRefreshInterval is configured here so the background refresh
+// loop rediscovers the issuer (and therefore drops the retired key) within
+// the test's lifetime. It must not be too short, though: refreshKeys only
+// ever swaps the verifier on a *successful* rediscovery, and if that
+// happens to land in the brief window between the warm Verify call below
+// and idp.Rotate(), the swap silently replaces the just-warmed verifier
+// with a fresh, empty-cache one before rotation ever happens — the test
+// would then still pass, but for the wrong reason (the fresh verifier
+// simply never learns the retired key, same as TestRejectsUnknownKeyID,
+// instead of exercising the warm-cache-then-refresh path this test exists
+// to cover). 150ms gives the test's own setup (RSA key generation, HTTP
+// roundtrips) — which can itself take tens of milliseconds under -race —
+// enough headroom to finish before the first tick can possibly fire. The
+// retry loop below has no fixed sleep before asserting rejection, because
+// the refresh happens on a ticker in a separate goroutine — asserting
+// immediately would be racy, and a fixed sleep would make the test slow or
+// flaky depending on scheduling.
 func TestRejectsAfterKeyRotation(t *testing.T) {
 	idp := testidp.New(t)
 	v := newVerifierWithConfig(t, identity.OIDCConfig{
 		IssuerURL:          idp.URL(),
 		Audience:           "test-audience",
 		SubjectClaim:       "sub",
-		KeyRefreshInterval: 20 * time.Millisecond,
+		KeyRefreshInterval: 150 * time.Millisecond,
 	})
 
 	token := idp.Token(validClaims(idp))
@@ -183,13 +194,36 @@ func TestRejectsAfterKeyRotation(t *testing.T) {
 // the identity provider would silently and permanently break verification
 // for the lifetime of the process — exactly the outage the refreshKeys
 // retry-on-error branch exists to prevent.
+//
+// The wait for "at least one refresh attempt has failed" polls
+// idp.DiscoveryRequests() instead of sleeping a fixed duration. A fixed
+// sleep can pass without a single refresh attempt ever having happened
+// (system under load, a ticker firing later than expected, the outage
+// window landing between ticks) — the assertion right after it would then
+// prove nothing while still reporting success. Polling the counter until
+// it has demonstrably moved past its pre-outage value closes that gap: the
+// test only proceeds once a real attempt against the unavailable issuer
+// has actually occurred.
+//
+// KeyRefreshInterval is 150ms, not something much shorter, for the same
+// reason explained in TestRejectsAfterKeyRotation above: refreshKeys only
+// swaps the verifier on a *successful* rediscovery, and a benign swap
+// landing in the narrow gap between the warm Verify call and
+// idp.SetUnavailable(true) would replace the just-warmed verifier with a
+// fresh, empty-cache one — which would then itself need a live key fetch
+// on the very next Verify call and could observe the (about to start)
+// outage, failing this test for a reason unrelated to what it is meant to
+// prove. This was reproduced directly: with a 20ms interval under -race,
+// the test failed intermittently with "fetching keys ... 503 Service
+// Unavailable" — proof that the swap-then-immediately-hit-by-outage
+// scenario is real, not hypothetical.
 func TestRecoversAfterProviderOutage(t *testing.T) {
 	idp := testidp.New(t)
 	v := newVerifierWithConfig(t, identity.OIDCConfig{
 		IssuerURL:          idp.URL(),
 		Audience:           "test-audience",
 		SubjectClaim:       "sub",
-		KeyRefreshInterval: 20 * time.Millisecond,
+		KeyRefreshInterval: 150 * time.Millisecond,
 	})
 
 	token := idp.Token(validClaims(idp))
@@ -197,12 +231,16 @@ func TestRecoversAfterProviderOutage(t *testing.T) {
 		t.Fatalf("Verify (before outage): %v", err)
 	}
 
+	requestsBeforeOutage := idp.DiscoveryRequests()
 	idp.SetUnavailable(true)
-	// There is no externally observable signal for "a refresh attempt just
-	// failed" (that's the point: it must be invisible to callers), so this
-	// waits out several refresh intervals to let multiple attempts fail
-	// before asserting the verifier survived them.
-	time.Sleep(5 * 20 * time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for idp.DiscoveryRequests() == requestsBeforeOutage {
+		if time.Now().After(deadline) {
+			t.Fatal("no refresh attempt reached the issuer while it was unavailable")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	if _, err := v.Verify(context.Background(), token); err != nil {
 		t.Fatalf("Verify (during outage): a failed refresh attempt disturbed the existing verifier: %v", err)
@@ -211,7 +249,7 @@ func TestRecoversAfterProviderOutage(t *testing.T) {
 	idp.SetUnavailable(false)
 	idp.Rotate()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(2 * time.Second)
 	for {
 		if _, err := v.Verify(context.Background(), token); err != nil {
 			return // the refresh loop recovered and picked up the new key set
