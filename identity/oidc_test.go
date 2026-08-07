@@ -12,11 +12,19 @@ import (
 
 func newVerifier(t *testing.T, idp *testidp.IDP, subjectClaim string) identity.Verifier {
 	t.Helper()
-	v, err := identity.NewOIDC(context.Background(), identity.OIDCConfig{
+	return newVerifierWithConfig(t, identity.OIDCConfig{
 		IssuerURL:    idp.URL(),
 		Audience:     "test-audience",
 		SubjectClaim: subjectClaim,
 	})
+}
+
+func newVerifierWithConfig(t *testing.T, cfg identity.OIDCConfig) identity.Verifier {
+	t.Helper()
+	// t.Context() is cancelled when the test ends, which stops the
+	// background key-refresh goroutine started by NewOIDC instead of
+	// leaking it for the lifetime of the test binary.
+	v, err := identity.NewOIDC(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("NewOIDC: %v", err)
 	}
@@ -99,7 +107,13 @@ func TestUsesConfiguredSubjectClaim(t *testing.T) {
 	}
 }
 
-func TestRejectsAfterKeyRotation(t *testing.T) {
+// TestRejectsUnknownKeyID covers the cold case: a verifier that has never
+// seen this issuer's keys before. The underlying key set fetches once, on
+// first use, and only ever sees the post-rotation key set — so the token
+// signed with the retired key is rejected immediately, without needing any
+// key refresh. This must not be confused with TestRejectsAfterKeyRotation
+// below, which covers the warm cache instead.
+func TestRejectsUnknownKeyID(t *testing.T) {
 	idp := testidp.New(t)
 	v := newVerifier(t, idp, "sub")
 
@@ -108,6 +122,74 @@ func TestRejectsAfterKeyRotation(t *testing.T) {
 
 	if _, err := v.Verify(context.Background(), token); err == nil {
 		t.Error("token signed with the retired key was accepted")
+	}
+}
+
+// TestRejectsAfterKeyRotation covers the realistic case: a long-running
+// verifier that has already cached the issuer's current signing key before
+// rotation happens. The underlying key set (coreos/go-oidc's RemoteKeySet)
+// only re-fetches keys for a key ID it has never seen — a previously seen
+// key ID keeps verifying against the stale cached key forever, even after
+// the provider retires it. Confirmed against the RemoteKeySet source
+// (github.com/coreos/go-oidc/v3/oidc/jwks.go, verify()) and by the inverse
+// experiment: without OIDCConfig.KeyRefreshInterval driving a periodic
+// rediscovery, this exact sequence keeps accepting the retired-key token.
+//
+// A very short KeyRefreshInterval is configured here so the background
+// refresh loop rediscovers the issuer (and therefore drops the retired key)
+// within the test's lifetime. The retry loop below has no fixed sleep
+// before asserting rejection, because the refresh happens on a ticker in a
+// separate goroutine — asserting immediately would be racy, and a fixed
+// sleep would make the test slow or flaky depending on scheduling.
+func TestRejectsAfterKeyRotation(t *testing.T) {
+	idp := testidp.New(t)
+	v := newVerifierWithConfig(t, identity.OIDCConfig{
+		IssuerURL:          idp.URL(),
+		Audience:           "test-audience",
+		SubjectClaim:       "sub",
+		KeyRefreshInterval: 20 * time.Millisecond,
+	})
+
+	token := idp.Token(validClaims(idp))
+
+	// Warm the cache: this Verify call is what makes the scenario
+	// realistic. Without it, the key ID would still be unknown to the
+	// verifier and TestRejectsUnknownKeyID's cold-case behaviour would
+	// apply instead.
+	if _, err := v.Verify(context.Background(), token); err != nil {
+		t.Fatalf("Verify (before rotation): %v", err)
+	}
+
+	idp.Rotate()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := v.Verify(context.Background(), token); err != nil {
+			return // rejected, as required
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("token signed with the retired key was still accepted after the refresh interval elapsed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestKeyRefreshCanBeDisabled documents and covers the escape hatch: a
+// negative KeyRefreshInterval disables the background refresh loop
+// entirely. This is the opposite of the security property under test
+// above and exists for tests/tools that want a fully deterministic
+// verifier with no background goroutine — never for production use.
+func TestKeyRefreshCanBeDisabled(t *testing.T) {
+	idp := testidp.New(t)
+	v := newVerifierWithConfig(t, identity.OIDCConfig{
+		IssuerURL:          idp.URL(),
+		Audience:           "test-audience",
+		SubjectClaim:       "sub",
+		KeyRefreshInterval: -1,
+	})
+
+	if _, err := v.Verify(context.Background(), idp.Token(validClaims(idp))); err != nil {
+		t.Fatalf("Verify: %v", err)
 	}
 }
 
