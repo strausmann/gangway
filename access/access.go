@@ -18,6 +18,7 @@ var ErrForbidden = errors.New("gangway: forbidden")
 // ToolKind marks a tool as reading or writing.
 type ToolKind string
 
+// The two recognized tool kinds.
 const (
 	KindRead  ToolKind = "read"
 	KindWrite ToolKind = "write"
