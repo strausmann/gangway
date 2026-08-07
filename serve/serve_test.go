@@ -19,6 +19,7 @@ import (
 
 	"github.com/strausmann/gangway/access"
 	"github.com/strausmann/gangway/accesslog"
+	"github.com/strausmann/gangway/backend"
 	"github.com/strausmann/gangway/identity/testidp"
 	"github.com/strausmann/gangway/serve"
 )
@@ -638,6 +639,22 @@ func newMCPServer() *mcp.Server {
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: id.Subject}}}, nil, nil
 		})
+	// Exercises backend.PassThrough exactly the way a real tool would:
+	// pull the incoming token out of the context via TokenFrom and hand
+	// it to TokenFor. Without TokenFrom, incoming is always "" and
+	// PassThrough refuses outright — this tool is the proof that the
+	// context plumbing actually delivers a usable token, not just that
+	// something is present in the context.
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "passthrough-tool"},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, any, error) {
+			id, _ := serve.IdentityFrom(ctx)
+			incoming, _ := serve.TokenFrom(ctx)
+			tok, err := backend.PassThrough().TokenFor(ctx, id, incoming)
+			if err != nil {
+				return nil, nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: tok}}}, nil, nil
+		})
 
 	return mcpServer
 }
@@ -812,6 +829,55 @@ func TestUnclassifiedToolDefaultsToWriteKind(t *testing.T) {
 	_, err = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "mystery-tool"})
 	if err == nil {
 		t.Fatal("CallTool(mystery-tool) succeeded, want an MCP-level error (unclassified defaults to write)")
+	}
+}
+
+// TestPassThroughReceivesTheIncomingToken is the end-to-end proof that
+// TokenFrom actually delivers a usable token to backend.PassThrough — not
+// just that a value sits in the context, but that a tool built on
+// PassThrough works: the incoming HTTP bearer token authenticates the
+// call, reaches the tool handler via TokenFrom, and comes back out of
+// backend.PassThrough().TokenFor unchanged.
+func TestPassThroughReceivesTheIncomingToken(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+
+	t.Setenv("GANGWAY_PUBLIC_BASE_URL", "https://mcp.example.com")
+	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
+	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "127.0.0.1/32,::1/128")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	gw, err := serve.New(context.Background(), cfg,
+		serve.WithLogWriter(&logs),
+		serve.WithToolKinds(map[string]access.ToolKind{"passthrough-tool": access.KindRead}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	token := idp.Token(map[string]any{
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-123",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	session := connectedClient(t, gw, newMCPServer(), token)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "passthrough-tool"})
+	if err != nil {
+		t.Fatalf("CallTool(passthrough-tool): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("result.IsError = true, want the tool to receive the incoming token: %+v", res.Content)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if text.Text != token {
+		t.Errorf("backend.PassThrough forwarded a different token than the one used to authenticate the call")
 	}
 }
 

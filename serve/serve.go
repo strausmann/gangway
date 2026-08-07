@@ -390,7 +390,9 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			s.challenge(w)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(identityInto(r.Context(), id)))
+		ctx := identityInto(r.Context(), id)
+		ctx = tokenInto(ctx, raw) // only the token that just passed verification — never before this point
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -418,6 +420,34 @@ func identityInto(ctx context.Context, id *identity.Identity) context.Context {
 func IdentityFrom(ctx context.Context) (*identity.Identity, bool) {
 	id, ok := ctx.Value(identityKey{}).(*identity.Identity)
 	return id, ok
+}
+
+type tokenKey struct{}
+
+func tokenInto(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, tokenKey{}, token)
+}
+
+// TokenFrom returns the bearer token the current caller presented, placed
+// into the context by the HTTP authentication layer (see Server.Handler)
+// once — and only once — that token has passed verification. It exists so
+// tool handlers can reach backend.PassThrough and backend.Exchange, both
+// of which need the caller's own incoming token as their TokenFor
+// "incoming" argument; without a way to retrieve it, neither is
+// reachable from inside a tool at all.
+//
+// What TokenFrom hands back is a valid credential belonging to whichever
+// caller made this specific request — not the server's own credential,
+// and not necessarily this caller's only one. Treat it accordingly:
+//
+//   - Never log it, and never place it anywhere a log write could reach
+//     it (an error message, a panic value, a debug dump of the context).
+//   - Never forward it anywhere except the one downstream service it was
+//     retrieved for (typically via backend.TokenSource.TokenFor).
+//   - Do not cache or persist it beyond the request it was read from.
+func TokenFrom(ctx context.Context) (string, bool) {
+	tok, ok := ctx.Value(tokenKey{}).(string)
+	return tok, ok
 }
 
 // Run serves until ctx is cancelled, then shuts down in an orderly
