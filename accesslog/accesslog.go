@@ -69,6 +69,21 @@ func escapeField(s string) string {
 	return b.String()
 }
 
+// EscapeField applies the same escaping Middleware applies to every
+// request-controlled field it logs (see escapeField). It exists for code
+// outside this package that writes into the same log stream Middleware
+// writes into but from a different call site — currently serve.Server's
+// origin-gate rejection line, which is written directly by an
+// origin.GateConfig.OnReject hook, not by Middleware itself.
+//
+// Anything sharing this package's output stream and skipping this call on
+// a request-controlled value reopens exactly the log-forging class of bug
+// this package's own escaping closes: an unescaped newline in the value
+// lets an attacker inject a fabricated log line — attributed to whatever
+// address and fields the attacker chooses — into a stream that feeds
+// intrusion detection.
+func EscapeField(s string) string { return escapeField(s) }
+
 type outcome struct {
 	mu      sync.Mutex
 	tool    string

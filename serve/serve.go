@@ -9,10 +9,13 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 
 	"github.com/strausmann/gangway/access"
 	"github.com/strausmann/gangway/accesslog"
@@ -43,6 +46,32 @@ const methodCallTool = "tools/call"
 // -32010 avoids all of those.
 const CodeForbidden int64 = -32010
 
+// wellKnownProtectedResourcePath is the RFC 9728 discovery path a
+// connector fetches after receiving the WWW-Authenticate challenge (see
+// challenge). Handler and challenge share this one constant so the
+// pointer challenge hands out and the route Handler actually serves can
+// never drift apart.
+const wellKnownProtectedResourcePath = "/.well-known/oauth-protected-resource"
+
+// syncWriter serializes writes to an underlying io.Writer. New wraps
+// whatever WithLogWriter configured (or os.Stdout, by default) in one of
+// these — see WithLogWriter for why: at least two independent call sites
+// write into the same stream per request in the general case, from
+// concurrently handled requests, and most io.Writer implementations
+// (a bytes.Buffer, many third-party log rotators) are not themselves safe
+// for concurrent use. Without this, concurrent writes can interleave
+// mid-line or corrupt the underlying buffer.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 // Server is an assembled, ready-to-run MCP server front end.
 //
 // A Server on its own only ever serves /healthz: without a call to
@@ -71,6 +100,14 @@ type Option func(*Server)
 func WithDecider(d access.Decider) Option { return func(s *Server) { s.decider = d } }
 
 // WithLogWriter redirects the access log. Defaults to stdout.
+//
+// The writer itself does not need to be safe for concurrent use: New wraps
+// whatever is configured (this option's writer, or the os.Stdout default)
+// in an internal serializing writer. At least two independent call sites
+// write into it per request in the general case — accesslog.Middleware and
+// the origin gate's rejection hook — from concurrently handled requests,
+// and a caller providing, say, a plain bytes.Buffer or an unbuffered file
+// handle should not have to reason about that to get correct output.
 func WithLogWriter(w io.Writer) Option { return func(s *Server) { s.logs = w } }
 
 // WithToolKinds tells the tool-authorization middleware installed by
@@ -112,6 +149,7 @@ func New(ctx context.Context, cfg *Config, opts ...Option) (*Server, error) {
 	for _, o := range opts {
 		o(s)
 	}
+	s.logs = &syncWriter{w: s.logs}
 
 	var err error
 	s.verifier, err = identity.NewOIDC(ctx, identity.OIDCConfig{
@@ -261,7 +299,10 @@ func (s *Server) toolMiddleware() mcp.Middleware {
 //
 //	access log        outermost, so refusals are recorded too
 //	  origin gate     before the body is read
-//	    authenticate  before the MCP layer sees anything
+//	    authenticate  before the MCP layer sees anything — but only for
+//	                  /mcp; /healthz and the RFC 9728 metadata document
+//	                  are reachable without a token (the latter
+//	                  deliberately: see the route registration below)
 //	      MCP handler tool authorization lives inside, in SDK middleware
 //	                  installed by AttachMCP (see toolMiddleware)
 func (s *Server) Handler() http.Handler {
@@ -270,6 +311,17 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Deliberately not behind authenticate: this is the document a
+	// connector fetches in response to the WWW-Authenticate challenge
+	// (see challenge), before it has a token — gating it would mean the
+	// pointer a 401 hands out itself resolves to a 401, a loop with no
+	// way out for a connector that only knows to follow the standard
+	// discovery flow.
+	mux.Handle(wellKnownProtectedResourcePath, auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/"),
+		AuthorizationServers:   []string{s.cfg.IssuerURL},
+		BearerMethodsSupported: []string{"header"},
+	}))
 	if s.mcp != nil {
 		mux.Handle("/mcp", s.authenticate(s.mcp))
 	}
@@ -279,7 +331,16 @@ func (s *Server) Handler() http.Handler {
 		Trusted: s.cfg.TrustedProxies,
 		Mode:    s.cfg.HeaderMode,
 		OnReject: func(r *http.Request, addr netip.Addr) {
-			_, _ = fmt.Fprintf(s.logs, "origin refused: addr=%s path=%s\n", addr, r.URL.Path)
+			// r.URL.Path is decoded, attacker-controlled input: without
+			// escaping, a %0A in the request path becomes a real
+			// newline here, forging an extra, unescaped line into the
+			// same stream accesslog.Middleware writes into — one that
+			// could be attributed to any address and status the
+			// attacker chooses. EscapeField applies the identical
+			// escaping Middleware itself applies, so this stays a
+			// single line no matter what the path contains.
+			_, _ = fmt.Fprintf(s.logs, "origin refused: addr=%s path=%s\n",
+				addr, accesslog.EscapeField(r.URL.Path))
 		},
 	})
 
@@ -311,8 +372,8 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 // own choosing.
 func (s *Server) challenge(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-		`Bearer resource_metadata="%s/.well-known/oauth-protected-resource"`,
-		strings.TrimSuffix(s.cfg.PublicBaseURL, "/")))
+		`Bearer resource_metadata="%s%s"`,
+		strings.TrimSuffix(s.cfg.PublicBaseURL, "/"), wellKnownProtectedResourcePath))
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 

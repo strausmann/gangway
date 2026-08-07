@@ -342,3 +342,44 @@ func TestFlushIsForwardedToUnderlyingWriter(t *testing.T) {
 		t.Errorf("expected Flush to be forwarded exactly once, got %d", fr.flushed)
 	}
 }
+
+// TestEscapeFieldMatchesMiddlewareEscaping proves EscapeField applies the
+// identical escaping Middleware applies internally — the whole point of
+// exporting it is that a second writer into the same stream (serve.Server's
+// origin-gate rejection line) gets exactly the same protection, not a
+// hand-rolled approximation of it that could drift.
+func TestEscapeFieldMatchesMiddlewareEscaping(t *testing.T) {
+	const raw = "before\nafter\"quoted\"back\\slash"
+
+	// What Middleware itself produces for this value, via the User-Agent
+	// field.
+	var buf bytes.Buffer
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	r.Header.Set("User-Agent", raw)
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	if !strings.Contains(buf.String(), accesslog.EscapeField(raw)) {
+		t.Errorf("EscapeField(%q) = %q, not found verbatim in Middleware's own output %q",
+			raw, accesslog.EscapeField(raw), buf.String())
+	}
+}
+
+func TestEscapeFieldEscapesNewline(t *testing.T) {
+	got := accesslog.EscapeField("before\nafter")
+	if strings.Contains(got, "\n") {
+		t.Errorf("EscapeField(%q) = %q, still contains a raw newline", "before\nafter", got)
+	}
+	if got != `before\x0Aafter` {
+		t.Errorf("EscapeField(%q) = %q, want %q", "before\nafter", got, `before\x0Aafter`)
+	}
+}
+
+func TestEscapeFieldPassesThroughOrdinaryText(t *testing.T) {
+	if got := accesslog.EscapeField("/mcp"); got != "/mcp" {
+		t.Errorf("EscapeField(%q) = %q, want it unchanged", "/mcp", got)
+	}
+}

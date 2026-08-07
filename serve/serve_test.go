@@ -3,6 +3,7 @@ package serve_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,8 +15,10 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 
 	"github.com/strausmann/gangway/access"
+	"github.com/strausmann/gangway/accesslog"
 	"github.com/strausmann/gangway/identity/testidp"
 	"github.com/strausmann/gangway/serve"
 )
@@ -182,6 +185,41 @@ func TestAccessLogRecordsRefusals(t *testing.T) {
 
 	if !strings.Contains(logs.String(), " 403 ") {
 		t.Errorf("access log %q does not contain the refusal", logs.String())
+	}
+}
+
+// TestOriginRefusalLogLineEscapesForgedNewline is the regression test for
+// the log-forging finding in the origin gate's rejection hook: r.URL.Path
+// is decoded, attacker-controlled input, and a request whose path decodes
+// to contain a newline must not be able to split that hook's log line in
+// two — the second half, unescaped, would read as a second, fabricated
+// log line, forgeable to any address and status the attacker chooses.
+func TestOriginRefusalLogLineEscapesForgedNewline(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	h := newServer(t, idp, &logs)
+
+	r := httptest.NewRequest(http.MethodGet, "/x%0Afake-line", nil)
+	r.RemoteAddr = "172.20.0.5:5000"
+	r.Header.Set("X-Forwarded-For", "203.0.113.9") // not in the allowlist
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	// Exactly two lines are expected for this one request: the raw
+	// origin-refusal line, and accesslog.Middleware's own combined-format
+	// line for the same (403) response. A decoded, unescaped newline in
+	// the path would add a third.
+	trimmed := strings.TrimRight(logs.String(), "\n")
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d log lines for one refused request, want exactly 2: %q", len(lines), logs.String())
+	}
+	if !strings.Contains(lines[0], accesslog.EscapeField("/x\nfake-line")) {
+		t.Errorf("origin-refusal line = %q, want the escaped path %q", lines[0], accesslog.EscapeField("/x\nfake-line"))
 	}
 }
 
@@ -761,5 +799,165 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 	}
 	if res.IsError {
 		t.Errorf("result.IsError = true, want AllowAll to permit the call")
+	}
+}
+
+// --- discovery: the reference a 401 hands out must actually resolve ---
+
+// TestChallengePointsToAFetchableMetadataDocument is the regression test
+// for the discovery-loop finding: a connector following RFC 9728 fetches
+// the WWW-Authenticate challenge's resource_metadata URL before it has a
+// token. This test does exactly that — literally follows the URL out of
+// the header, unmodified — rather than asserting anything about the route
+// directly, so it fails the same way a real connector would if the route
+// were missing, gated behind authenticate (a loop with no way out), or
+// pointed at the wrong address.
+func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
+	idp := testidp.New(t)
+
+	// The listener has to exist before Config.Handler can be attached,
+	// but PublicBaseURL — which the challenge's resource_metadata URL is
+	// built from — has to name this listener's own address, or the
+	// fetch below would go nowhere. NewUnstartedServer breaks that
+	// chicken-and-egg problem: the listener (and so its address) exists
+	// before Start is called.
+	ts := httptest.NewUnstartedServer(nil)
+	publicBaseURL := "http://" + ts.Listener.Addr().String()
+
+	t.Setenv("GANGWAY_PUBLIC_BASE_URL", publicBaseURL)
+	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
+	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "127.0.0.1/32,::1/128")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	var logs syncBuffer
+	gw, err := serve.New(context.Background(), cfg, serve.WithLogWriter(&logs))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.AttachMCP(stubMCPServer())
+
+	ts.Config.Handler = gw.Handler()
+	ts.Start()
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/mcp")
+	if err != nil {
+		t.Fatalf("GET /mcp: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /mcp = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+
+	challenge := resp.Header.Get("WWW-Authenticate")
+	_, rest, ok := strings.Cut(challenge, `resource_metadata="`)
+	if !ok {
+		t.Fatalf("WWW-Authenticate = %q, no resource_metadata reference found", challenge)
+	}
+	metadataURL, _, ok := strings.Cut(rest, `"`)
+	if !ok {
+		t.Fatalf("WWW-Authenticate = %q, resource_metadata value not terminated", challenge)
+	}
+
+	mresp, err := http.Get(metadataURL)
+	if err != nil {
+		t.Fatalf("GET %s (the URL the 401 itself handed out): %v", metadataURL, err)
+	}
+	defer func() { _ = mresp.Body.Close() }()
+	if mresp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", metadataURL, mresp.StatusCode, http.StatusOK)
+	}
+
+	var doc oauthex.ProtectedResourceMetadata
+	if err := json.NewDecoder(mresp.Body).Decode(&doc); err != nil {
+		t.Fatalf("resource metadata document at %s is not valid JSON: %v", metadataURL, err)
+	}
+	if doc.Resource != publicBaseURL {
+		t.Errorf("Resource = %q, want %q", doc.Resource, publicBaseURL)
+	}
+	if len(doc.AuthorizationServers) != 1 || doc.AuthorizationServers[0] != idp.URL() {
+		t.Errorf("AuthorizationServers = %v, want [%q]", doc.AuthorizationServers, idp.URL())
+	}
+}
+
+// --- WithLogWriter: the writer need not be safe for concurrent use ---
+
+// TestLogWriterNeedNotBeConcurrencySafe reproduces the review finding
+// directly: a plain bytes.Buffer — not safe for concurrent use on its own
+// — handed to WithLogWriter, hit by concurrent requests that exercise
+// both call sites writing into it (accesslog.Middleware, once per
+// request, and the origin gate's rejection hook, for the refused half).
+// Run under -race, this fails immediately if New ever stops wrapping the
+// configured writer in something that serializes access to it.
+func TestLogWriterNeedNotBeConcurrencySafe(t *testing.T) {
+	idp := testidp.New(t)
+
+	t.Setenv("GANGWAY_PUBLIC_BASE_URL", "https://mcp.example.com")
+	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
+	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "160.79.104.0/21")
+	t.Setenv("GANGWAY_TRUSTED_PROXIES", "127.0.0.1/32")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	var buf bytes.Buffer // deliberately not this file's syncBuffer
+	gw, err := serve.New(context.Background(), cfg, serve.WithLogWriter(&buf))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.AttachMCP(stubMCPServer())
+
+	ts := httptest.NewServer(gw.Handler())
+	defer ts.Close()
+
+	const n = 20
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(refused bool) {
+			defer wg.Done()
+			req, err := http.NewRequest(http.MethodGet, ts.URL+"/healthz", nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			// The peer (127.0.0.1) is a trusted proxy, so the forwarded
+			// address decides whether the origin gate lets the request
+			// through — independent of the loopback peer every request
+			// in this test actually arrives from.
+			if refused {
+				req.Header.Set("X-Forwarded-For", "203.0.113.9")
+			} else {
+				req.Header.Set("X-Forwarded-For", "160.79.104.1")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = resp.Body.Close()
+		}(i%2 == 0)
+	}
+	wg.Wait()
+
+	// -race is the actual assertion here; this is a secondary sanity
+	// check that nothing got corrupted along the way. A refused request
+	// writes two lines (the origin-refusal line and accesslog's own),
+	// an allowed one writes one.
+	trimmed := strings.TrimRight(buf.String(), "\n")
+	var lines []string
+	if trimmed != "" {
+		lines = strings.Split(trimmed, "\n")
+	}
+	const wantLines = n/2*2 + n/2
+	if len(lines) != wantLines {
+		t.Errorf("got %d log lines from %d concurrent requests, want %d", len(lines), n, wantLines)
 	}
 }
