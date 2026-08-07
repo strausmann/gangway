@@ -95,8 +95,8 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// Lieber gar nicht laufen als offen laufen: no allowlist and no remote
-	// source to fetch one from means every caller would be let in.
+	// Better not to run at all than to run wide open: no allowlist and no
+	// remote source to fetch one from means every caller would be let in.
 	if len(cfg.AllowedPrefixes) == 0 && cfg.RemoteListURL == "" {
 		return nil, fmt.Errorf(
 			"gangway: GANGWAY_ALLOWED_PREFIXES or GANGWAY_REMOTE_LIST_URL is required — " +
