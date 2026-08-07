@@ -146,6 +146,12 @@ func (l *remoteList) refresh(ctx context.Context) (err error) {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
+		// Drain (bounded, same limit as the success path below) so the
+		// underlying connection can be reused for the next refresh
+		// instead of being torn down and rebuilt — relevant during an
+		// extended outage at the provider, when every refresh hits this
+		// path.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<20))
 		return fmt.Errorf("gangway: fetch %s: status %d", l.cfg.URL, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
