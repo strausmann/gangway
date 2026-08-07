@@ -300,3 +300,76 @@ func TestRemoteListSwallowsCloseErrorWhenAnotherErrorAlreadyWon(t *testing.T) {
 		t.Errorf("error = %q, want it to mention the status failure", err.Error())
 	}
 }
+
+// TestRemoteListErrorNeverLeaksURLPathOrQuery guards the security property
+// behind hostOnly/withoutURL: RemoteListConfig.URL is caller-supplied and
+// might be a signed URL or carry a credential in its path or query. Every
+// place refresh (and NewRemoteList's wrap of its first call) can fail must
+// report only the host, never the full URL — across every distinct failure
+// mode that reaches for the URL, not just the one status-code path a
+// casual read might settle for.
+func TestRemoteListErrorNeverLeaksURLPathOrQuery(t *testing.T) {
+	const secret = "leaked-super-secret-token-must-never-appear-in-a-log"
+
+	assertNoLeak := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error leaked the URL's path/query: %v", err)
+		}
+	}
+
+	t.Run("non-200 status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		_, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
+			URL:      srv.URL + "/" + secret + "?token=" + secret,
+			Interval: time.Hour,
+			Parse:    origin.ParseOpenAIPrefixes,
+		})
+		assertNoLeak(t, err)
+	})
+
+	t.Run("parsed list is empty", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"prefixes":[{}]}`))
+		}))
+		defer srv.Close()
+
+		_, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
+			URL:      srv.URL + "/" + secret + "?token=" + secret,
+			Interval: time.Hour,
+			Parse:    origin.ParseOpenAIPrefixes,
+		})
+		assertNoLeak(t, err)
+	})
+
+	t.Run("server unreachable", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		url := srv.URL + "/" + secret + "?token=" + secret
+		srv.Close() // nothing is listening at this address anymore
+
+		_, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
+			URL:      url,
+			Interval: time.Hour,
+			Parse:    origin.ParseOpenAIPrefixes,
+		})
+		assertNoLeak(t, err)
+	})
+
+	t.Run("invalid URL", func(t *testing.T) {
+		// A control character makes the URL unparsable — the
+		// request-construction error path, before any request is sent.
+		_, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
+			URL:      "http://exchange.example/" + secret + "\n",
+			Interval: time.Hour,
+			Parse:    origin.ParseOpenAIPrefixes,
+		})
+		assertNoLeak(t, err)
+	})
+}

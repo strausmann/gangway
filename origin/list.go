@@ -3,10 +3,12 @@ package origin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -102,7 +104,7 @@ func NewRemoteList(ctx context.Context, cfg RemoteListConfig) (List, error) {
 
 	l := &remoteList{cfg: cfg}
 	if err := l.refresh(ctx); err != nil {
-		return nil, fmt.Errorf("gangway: initial fetch of %s: %w", cfg.URL, err)
+		return nil, fmt.Errorf("gangway: initial fetch of %s: %w", hostOnly(cfg.URL), err)
 	}
 
 	go l.loop(ctx)
@@ -131,11 +133,17 @@ func (l *remoteList) refresh(ctx context.Context) (err error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, l.cfg.URL, nil)
 	if err != nil {
-		return err
+		// http.NewRequestWithContext wraps a malformed URL in a *url.Error
+		// whose own Error() text echoes it back verbatim — path, query and
+		// all. withoutURL strips that layer; hostOnly names only the host
+		// in the message we build ourselves.
+		return fmt.Errorf("gangway: build request for %s: %w", hostOnly(l.cfg.URL), withoutURL(err))
 	}
 	resp, err := l.cfg.Client.Do(req)
 	if err != nil {
-		return err
+		// Same *url.Error wrapping as above, this time from the transport
+		// (e.g. a dial failure) rather than URL parsing.
+		return fmt.Errorf("gangway: fetch %s: %w", hostOnly(l.cfg.URL), withoutURL(err))
 	}
 	defer func() {
 		// Only report the close error when nothing else already failed —
@@ -152,7 +160,7 @@ func (l *remoteList) refresh(ctx context.Context) (err error) {
 		// extended outage at the provider, when every refresh hits this
 		// path.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<20))
-		return fmt.Errorf("gangway: fetch %s: status %d", l.cfg.URL, resp.StatusCode)
+		return fmt.Errorf("gangway: fetch %s: status %d", hostOnly(l.cfg.URL), resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -167,7 +175,7 @@ func (l *remoteList) refresh(ctx context.Context) (err error) {
 		// list with an empty one — that would either allow no one, if
 		// this is the first fetch, or (worse) it would look like a no-op
 		// and be missed. Treat it the same as a failed fetch.
-		return fmt.Errorf("gangway: fetch %s: parsed list is empty", l.cfg.URL)
+		return fmt.Errorf("gangway: fetch %s: parsed list is empty", hostOnly(l.cfg.URL))
 	}
 
 	l.mu.Lock()
@@ -180,6 +188,29 @@ func (l *remoteList) Contains(addr netip.Addr) bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return inAny(addr, l.prefixes)
+}
+
+// hostOnly reduces a URL to scheme and host, for error messages: enough to
+// identify which provider a fetch failed against, without repeating a path
+// or query string that might carry a signed URL or an embedded credential.
+func hostOnly(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return "(unparsable URL)"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// withoutURL strips the *url.Error wrapper that net/http adds around both
+// request-construction and transport failures. Its own Error() text embeds
+// the full request URL — including any path or query that might carry a
+// signed URL or an embedded credential — but the cause it wraps does not.
+func withoutURL(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Err
+	}
+	return err
 }
 
 // ParseOpenAIPrefixes reads OpenAI's published connector IP-range format —
