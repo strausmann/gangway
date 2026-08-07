@@ -144,10 +144,26 @@ curl http://localhost:8080/healthz
 # ok
 ```
 
-`/mcp` needs a bearer token issued by the configured issuer, and a peer
-address that the allowlist accepts — that is the point of this project.
-Point an MCP-capable client (or connector) at
-`http://localhost:8080/mcp` with a valid token to reach the `ping` tool.
+This returns `ok` from `localhost` even though `GANGWAY_ALLOWED_PREFIXES`
+above was set to a documentation-only range that does not include your
+machine — deliberately: `/healthz` is exempt from the origin allowlist. A
+liveness or readiness probe runs from an address that will never appear
+in a connector allowlist, and gating it the same way as `/mcp` would
+invite the reflex fix of adding the prober's address to
+`GANGWAY_ALLOWED_PREFIXES` — which widens *every* route Gangway serves,
+not just this one (see [Behind a proxy](behind-a-proxy.md) for why that
+is the single easiest way to defeat the allowlist without anything
+failing loudly).
+
+`/mcp` is not exempt: it needs a bearer token issued by the configured
+issuer, and a peer address the allowlist actually accepts — that is the
+point of this project, so with the example value above a local `curl` or
+MCP client reaches neither `/mcp` nor the
+`/.well-known/oauth-protected-resource` metadata document a connector
+would fetch first. Set `GANGWAY_ALLOWED_PREFIXES` to a range that
+actually covers your caller, then point an MCP-capable client (or
+connector) at `http://localhost:8080/mcp` with a valid token to reach the
+`ping` tool.
 
 ## Next steps
 

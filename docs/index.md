@@ -44,6 +44,8 @@ for every server.
   that runs: five environment variables, one tool, `go run`.
 - [Configuration](configuration.md) lists every environment variable
   Gangway reads.
+- [Backend credentials](backend.md) covers the other credential: the one
+  your tools use to call the service *behind* your MCP server.
 - [Providers](providers/entra.md) covers the two identity providers this
   project has been run against: [Microsoft Entra ID](providers/entra.md) and
   [Authentik](providers/authentik.md).
@@ -53,6 +55,28 @@ for every server.
 
 ## Known limitations
 
+- **Authorization and access logging cover tool calls only.** The
+  authorization middleware `AttachMCP` installs inspects exactly one MCP
+  method, `tools/call` — it checks `method != "tools/call"` and, for
+  everything else, passes the request straight through unchanged. A
+  server that also registers MCP **resources** or **resource templates**
+  (`Server.AddResource`, `Server.AddResourceTemplate`) or **prompts**
+  (`Server.AddPrompt`) gets no authorization check and no access-log
+  outcome for calls to them — the same authenticated caller a writing
+  *tool* call correctly refuses can still read a resource's content
+  outright. This matches the design brief's own framing —
+  authorization *per tool* — but it is easy to miss if you assume every
+  MCP capability is covered the same way tools are. If your server
+  exposes resources or prompts with content that needs the same
+  protection, that protection has to be added separately; Gangway does
+  not provide it today.
+- **`PassThrough` and `Exchange` need a token Gangway does not currently
+  hand them.** See [Backend credentials](backend.md) for what this means
+  in practice; in short, the caller's raw bearer token is verified and
+  discarded by the authentication layer, not retained anywhere a tool
+  handler can retrieve it, so these two `backend.TokenSource`
+  implementations are not yet usable end to end through the documented
+  `AttachMCP` flow the way `StaticToken` and `PerUser` are.
 - **Token exchange authenticates by form field only.** `backend.Exchange`
   implements [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)
   token exchange by sending `client_id` and `client_secret` in the POST

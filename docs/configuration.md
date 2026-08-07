@@ -4,10 +4,17 @@ icon: lucide/settings
 
 # Configuration
 
-`serve.LoadConfig()` reads every setting from the environment — never from a
-file — so that credentials never end up sitting on disk next to the binary.
-It fails to start rather than come up with a gap: a missing issuer,
-audience, public base URL, or allowlist is an error, not a silent default.
+`serve.LoadConfig()` reads every one of the settings below from the
+environment — never from a file — so that credentials never end up sitting
+on disk next to the binary. It fails to start rather than come up with a
+gap: a missing issuer, audience, public base URL, or allowlist is an error,
+not a silent default.
+
+One setting on this page is the exception to "everything comes from the
+environment": the OIDC key-refresh interval, covered under
+[Identity](#identity), is reachable only by calling `identity.NewOIDC`
+directly with your own `identity.OIDCConfig` — bypassing `serve.LoadConfig`
+and `serve.New` — not through any `GANGWAY_*` variable.
 
 Error messages name the offending variable but never its value. Several of
 these variables are not meant to be echoed back — allowlist prefixes, writer
@@ -55,6 +62,29 @@ front of a real proxy.
 |---|---|---|
 | `GANGWAY_SUBJECT_CLAIM` | The claim used as the caller's stable identifier. `sub` works for most providers; Entra ID pseudonymizes it per application, so `oid` is the tenant-stable choice there — see [Microsoft Entra ID](providers/entra.md). | `sub` |
 
+### Key rotation
+
+`identity.NewOIDC` — what `serve.New` calls internally to build the
+verifier — refetches the issuer's discovery document and signing keys on a
+background timer, defaulting to **every 15 minutes**, and swaps in a
+verifier built from whatever it just fetched, dropping any key the
+previous verifier trusted that is no longer being published.
+
+This is the practical answer to a stolen signing key: rotating the key at
+the identity provider does not immediately invalidate tokens signed with
+the old one everywhere — it invalidates them here only once the next
+background refresh has run. Between the rotation and that refresh, a
+token forged with the compromised key would still verify. With the
+default interval, that window is at most 15 minutes; it does not shrink
+by rotating faster at the provider, only by refreshing faster here.
+
+There is currently **no `GANGWAY_*` variable** for this interval. It is
+set through `identity.OIDCConfig.KeyRefreshInterval`, a field on the
+`identity` package's own config type — reachable only by calling
+`identity.NewOIDC` yourself instead of going through `serve.LoadConfig`
+and `serve.New`. If you need a shorter window than 15 minutes, that is
+the path; there is no `Option` on `serve.Server` for it today.
+
 ## Authorization: who may call a writing tool
 
 Reading tools (`access.KindRead`, assigned via `serve.WithToolKinds`) are
@@ -72,6 +102,26 @@ Leaving `GANGWAY_WRITERS_CLAIM` or `GANGWAY_WRITERS_VALUE` empty while
 — it does the opposite. A forgotten setting must not open the server, so
 every writing call is refused until both are configured or the default is
 explicitly enabled.
+
+### Replacing the decision entirely
+
+The read/write claim check above is `access.NewGrid`, the default
+decider `serve.New` builds from the three settings in this section. It
+can be replaced outright with `serve.WithDecider(...)`. The one
+alternative Gangway ships is `access.AllowAll()`, an exported `Decider`
+that permits **every** authenticated caller to call **every** tool —
+reading or writing, no claim check at all:
+
+```go
+gw, err := serve.New(ctx, cfg, serve.WithDecider(access.AllowAll()))
+```
+
+This is not a relaxed default to reach for casually — it collapses the
+entire read/write distinction this section is about. It only makes sense
+for a server whose tools are all equally harmless to any authenticated
+caller (every tool reads, say, or the deployment has exactly one trusted
+caller). For anything else, the three `GANGWAY_WRITERS_*` settings above
+are the intended path.
 
 ## Network
 

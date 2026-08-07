@@ -18,6 +18,29 @@ calling.
 | Several proxies | `GANGWAY_CLIENT_IP_HEADER=x-forwarded-for` — read right to left, skipping entries from `GANGWAY_TRUSTED_PROXIES`. |
 | Cloudflare outermost | `GANGWAY_CLIENT_IP_HEADER=cf-connecting-ip`. |
 
+!!! danger "Never put your own proxy, host, or container network in the allowlist"
+
+    `GANGWAY_ALLOWED_PREFIXES` (and `GANGWAY_REMOTE_LIST_URL`) answer one
+    question: **who may call this server** — the real, original caller.
+    They do not answer **who may relay a call**. Adding your reverse
+    proxy's own address, the host it runs on, or the Docker network it
+    shares with Gangway to that allowlist does not narrow anything — it
+    widens it to everyone who can reach the proxy, because one allowlist
+    governs every route Gangway serves, not just the one you were trying
+    to fix. The origin check for the actual endpoint you care about is
+    quietly defeated, and nothing about the server's behavior reveals
+    that it happened.
+
+    This mistake is easy to reach for. Something behind the proxy
+    doesn't come back the way you expected, and adding the proxy's own
+    address to the allowlist looks like the obvious, minimal fix — it
+    is the wrong one. If a proxy's address needs to be trusted for
+    anything, that is what `GANGWAY_TRUSTED_PROXIES` is for: it tells
+    Gangway whose *forwarding header* to believe, not who may call. The
+    two settings look similar and are not interchangeable — one narrows
+    who reaches the server, the other only decides whose word to take
+    for who that caller behind them was.
+
 **Adding a proxy later invalidates this choice.** With `x-real-ip` behind a
 chain, the header carries the address of the *last* proxy, not the caller —
 because each proxy in the chain overwrites it with what it saw immediately
