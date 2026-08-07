@@ -15,7 +15,7 @@ func TestServesDiscoveryDocument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get discovery: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(t, resp)
 
 	var doc struct {
 		Issuer  string `json:"issuer"`
@@ -53,7 +53,7 @@ func TestSetUnavailableFailsRequestsUntilCleared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get discovery: %v", err)
 	}
-	resp.Body.Close()
+	closeBody(t, resp)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("discovery status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
@@ -62,7 +62,7 @@ func TestSetUnavailableFailsRequestsUntilCleared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get keys: %v", err)
 	}
-	resp.Body.Close()
+	closeBody(t, resp)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("keys status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
@@ -73,7 +73,7 @@ func TestSetUnavailableFailsRequestsUntilCleared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get discovery after recovery: %v", err)
 	}
-	resp.Body.Close()
+	closeBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("discovery status after recovery = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
@@ -92,7 +92,7 @@ func TestDiscoveryRequestsCountsRejectedRequestsToo(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get discovery: %v", err)
 		}
-		resp.Body.Close()
+		closeBody(t, resp)
 	}
 
 	get(t)
@@ -113,7 +113,7 @@ func fetchKeyID(t *testing.T, base string) string {
 	if err != nil {
 		t.Fatalf("get keys: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(t, resp)
 
 	var set struct {
 		Keys []struct {
@@ -127,4 +127,13 @@ func fetchKeyID(t *testing.T, base string) string {
 		t.Fatalf("got %d keys, want 1", len(set.Keys))
 	}
 	return set.Keys[0].Kid
+}
+
+// closeBody closes an HTTP response body and fails the test if closing it
+// returns an error, instead of discarding it.
+func closeBody(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("close response body: %v", err)
+	}
 }

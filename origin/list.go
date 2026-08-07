@@ -137,7 +137,13 @@ func (l *remoteList) refresh(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Only report the close error when nothing else already failed —
+		// a read or parse error is the more useful cause to surface.
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("gangway: fetch %s: status %d", l.cfg.URL, resp.StatusCode)

@@ -17,6 +17,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 )
 
+// IDP is a test-only OpenID Connect issuer, returned by New.
 type IDP struct {
 	srv *httptest.Server
 
@@ -58,6 +59,8 @@ func (i *IDP) newKey() {
 // valid but no longer verify — this is how key rollover is tested.
 func (i *IDP) Rotate() { i.newKey() }
 
+// URL returns the issuer's base URL, suitable as the Verifier's issuer
+// configuration in tests.
 func (i *IDP) URL() string { return i.srv.URL }
 
 // SetUnavailable makes both the discovery and keys endpoints respond with

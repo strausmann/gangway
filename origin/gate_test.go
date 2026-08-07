@@ -101,7 +101,7 @@ func TestGateRefusalIsTerse(t *testing.T) {
 		Allow:   origin.Static(nil),
 		Trusted: nil,
 		Mode:    origin.ModeXForwardedFor,
-	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	})(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	r.RemoteAddr = "203.0.113.9:5000"
@@ -133,7 +133,7 @@ func TestGateCallsOnRejectWithTheRefusedAddress(t *testing.T) {
 			gotReq = r
 			gotAddr = addr
 		},
-	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	})(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("handler must not run when the caller is refused")
 	}))
 
@@ -181,7 +181,7 @@ func TestGateWithoutOnRejectDoesNotPanic(t *testing.T) {
 		Allow: origin.Static(nil),
 		Mode:  origin.ModeXForwardedFor,
 		// OnReject deliberately left nil.
-	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	})(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
 	r.RemoteAddr = "203.0.113.9:5000"
