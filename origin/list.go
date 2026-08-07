@@ -45,7 +45,15 @@ func (c *combined) Contains(addr netip.Addr) bool {
 type RemoteListConfig struct {
 	// URL is fetched on start and then every Interval.
 	URL string
-	// Interval between refreshes. Zero or negative falls back to one hour.
+	// Interval between refreshes. Zero or negative falls back to one
+	// hour; any positive value, however small, is otherwise accepted as
+	// given. This package deliberately does not impose a minimum: a
+	// caller who constructs RemoteListConfig directly is assumed to know
+	// what they are asking for. A value that is too small will hammer
+	// the provider with requests. Callers who derive Interval from an
+	// environment variable should not rely on this package for
+	// protection against a misconfigured, too-small value — that floor
+	// is enforced where the environment is parsed, not here.
 	Interval time.Duration
 	// Parse turns the response body into prefixes.
 	Parse func([]byte) ([]netip.Prefix, error)
@@ -58,6 +66,18 @@ type remoteList struct {
 
 	mu       sync.RWMutex
 	prefixes []netip.Prefix
+
+	// afterRefresh, when set, is invoked synchronously at the end of
+	// every refresh — initial and background, successful or not — after
+	// any state change from that refresh has already been applied. It
+	// exists solely so tests can wait deterministically for a specific
+	// background refresh to have fully completed, instead of inferring
+	// completion from an observable side effect such as the request
+	// having reached the server (which races the mutex-protected state
+	// update: the request can be observed as received before the state
+	// it caused, or failed to cause, is actually committed). Nil outside
+	// of tests; production callers never set it.
+	afterRefresh func(err error)
 }
 
 // NewRemoteList fetches the list once and then keeps it fresh in the
@@ -104,7 +124,11 @@ func (l *remoteList) loop(ctx context.Context) {
 	}
 }
 
-func (l *remoteList) refresh(ctx context.Context) error {
+func (l *remoteList) refresh(ctx context.Context) (err error) {
+	if l.afterRefresh != nil {
+		defer func() { l.afterRefresh(err) }()
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, l.cfg.URL, nil)
 	if err != nil {
 		return err

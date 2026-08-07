@@ -77,47 +77,19 @@ func TestRemoteListFailsWhenParsedListIsEmpty(t *testing.T) {
 	}
 }
 
-func TestRemoteListKeepsLastGoodStateOnLaterFailure(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
-			_, _ = w.Write([]byte(`{"prefixes":[{"ipv4Prefix":"198.51.100.0/24"}]}`))
-			return
-		}
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	// A generous interval: short enough that the test does not stall, but
-	// long enough that the background loop does not race the assertions
-	// below under -race and load (a 20ms interval was observed to make an
-	// earlier test in this codebase flaky for exactly that reason).
-	l, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
-		URL:      srv.URL,
-		Interval: 100 * time.Millisecond,
-		Parse:    origin.ParseOpenAIPrefixes,
-	})
-	if err != nil {
-		t.Fatalf("NewRemoteList: %v", err)
-	}
-
-	// Wait for the event (a second call reaching the server), not the
-	// clock: poll the counter with a generous deadline instead of sleeping
-	// a fixed duration and hoping the refresh already ran.
-	deadline := time.After(5 * time.Second)
-	for calls.Load() < 2 {
-		select {
-		case <-deadline:
-			t.Fatal("refresh never ran")
-		default:
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-
-	if !l.Contains(netip.MustParseAddr("198.51.100.5")) {
-		t.Error("a failed refresh discarded the last good state — it must be kept")
-	}
-}
+// TestRemoteListKeepsLastGoodStateOnLaterFailure was here as a black-box
+// test that inferred a background refresh's completion from the request
+// having reached the test server. That signal races the refresh's own
+// mutex-protected state update: under load and -race, the assertion could
+// run in the window after the server received the second (failing)
+// request but before remoteList.refresh had finished deciding not to
+// touch the state — a run with the safety property inverted (a failed
+// refresh discarding the last good state) was observed to pass roughly 1
+// time in 4 despite being wrong. The deterministic replacement, driven by
+// a per-refresh completion callback instead of the request count, lives
+// in list_internal_test.go as
+// TestRemoteListKeepsLastGoodStateOnLaterFailure (white-box: the callback
+// is an unexported field).
 
 func TestParseOpenAIPrefixesIgnoresNonIPv4Entries(t *testing.T) {
 	got, err := origin.ParseOpenAIPrefixes([]byte(
