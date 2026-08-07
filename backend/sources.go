@@ -40,7 +40,9 @@ func (p *perUser) TokenFor(ctx context.Context, id *identity.Identity, _ string)
 type passThrough struct{}
 
 // PassThrough forwards the caller's own token. Only correct when the
-// service behind the server accepts tokens from the same issuer.
+// service behind the server accepts tokens from the same issuer; needs a
+// non-empty incoming (see TokenSource — serve.TokenFrom(ctx) is where a
+// tool handler behind serve.Server gets one).
 func PassThrough() TokenSource { return passThrough{} }
 
 func (passThrough) TokenFor(_ context.Context, _ *identity.Identity, incoming string) (string, error) {
@@ -63,7 +65,10 @@ type ExchangeConfig struct {
 
 type exchange struct{ cfg ExchangeConfig }
 
-// Exchange trades the caller's token for one the service accepts.
+// Exchange trades the caller's token for one the service accepts; like
+// PassThrough, it needs a non-empty incoming (see TokenSource —
+// serve.TokenFrom(ctx) is where a tool handler behind serve.Server gets
+// one).
 func Exchange(cfg ExchangeConfig) TokenSource {
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{Timeout: 30 * time.Second}

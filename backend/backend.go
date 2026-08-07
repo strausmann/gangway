@@ -15,7 +15,8 @@ import (
 // TokenSource supplies the credential for one call.
 //
 // incoming is the bearer token the caller presented; it is empty unless
-// the source needs it.
+// the source needs it. A tool handler running behind serve.Server obtains
+// it with serve.TokenFrom(ctx).
 type TokenSource interface {
 	TokenFor(ctx context.Context, id *identity.Identity, incoming string) (string, error)
 }
