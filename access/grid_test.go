@@ -125,6 +125,36 @@ func TestGridAcceptsStringSliceClaim(t *testing.T) {
 	})
 }
 
+func TestGridRefusesUnrecognizedToolKind(t *testing.T) {
+	// Only KindRead and KindWrite are known. An empty Kind (a caller who
+	// forgot to set it) or an invented one (a typo, or a third kind added
+	// to the package later without teaching this decider about it) must
+	// be refused, not silently treated as read-only and let through.
+	d := access.NewGrid(access.GridConfig{
+		WritersClaim: "roles",
+		WritersValue: "mcp-writer",
+	})
+
+	tests := []struct {
+		name string
+		kind access.ToolKind
+	}{
+		{name: "empty kind", kind: ""},
+		{name: "invented kind", kind: access.ToolKind("delete")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := d.Allow(context.Background(), access.Request{
+				Tool: "mystery_tool", Kind: tc.kind, Identity: id(nil),
+			})
+			if !errors.Is(err, access.ErrForbidden) {
+				t.Errorf("Allow returned %v, want ErrForbidden", err)
+			}
+		})
+	}
+}
+
 func TestGridUnrecognizedClaimShapeRefusesWriting(t *testing.T) {
 	// A claim value that is neither string, []any nor []string (e.g. a
 	// number) must not be mistaken for a match.

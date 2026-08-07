@@ -25,8 +25,16 @@ func (g *grid) Allow(_ context.Context, req Request) error {
 	if req.Identity == nil {
 		return ErrForbidden
 	}
-	if req.Kind != KindWrite {
+	// Handle the two known kinds explicitly and refuse everything else —
+	// an empty Kind, a typo, or a third kind added later must not fall
+	// through to an implicit allow.
+	switch req.Kind {
+	case KindRead:
 		return nil
+	case KindWrite:
+		// handled below
+	default:
+		return ErrForbidden
 	}
 	if g.cfg.AllowWriteByDefault {
 		return nil
