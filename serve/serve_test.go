@@ -92,13 +92,18 @@ func newServer(t *testing.T, idp *testidp.IDP, logs *syncBuffer) http.Handler {
 	// TestMissingTokenIsUnauthorizedWithChallenge (and every other test
 	// sharing this helper) needs an attached MCP handler: Handler only
 	// mounts /mcp — and so only reaches the authenticate layer at all —
-	// once something has been attached. The handler itself is never
+	// once something has been attached. The server itself is never
 	// exercised by these tests, which never get past the origin gate or
-	// the authenticate layer, so a bare 200 stands in for it.
-	s.AttachMCP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	// the authenticate layer, so an empty stub stands in for it.
+	s.AttachMCP(stubMCPServer())
 	return s.Handler()
+}
+
+// stubMCPServer returns a bare *mcp.Server with no tools registered, for
+// tests that only exercise the HTTP layers (origin gate, authenticate)
+// and never reach the MCP server itself.
+func stubMCPServer() *mcp.Server {
+	return mcp.NewServer(&mcp.Implementation{Name: "gangway-test-stub", Version: "0.0.0"}, nil)
 }
 
 func request(t *testing.T, h http.Handler, remote, forwarded, token string) *httptest.ResponseRecorder {
@@ -210,6 +215,13 @@ func TestAuthenticateRejectsInvalidToken(t *testing.T) {
 	}
 }
 
+// TestAuthenticateAllowsValidTokenAndPublishesIdentity checks identity
+// propagation end-to-end through a real MCP client: "whoami-tool" (see
+// newMCPServer) reports back whatever IdentityFrom(ctx) sees inside the
+// tool-authorization middleware and the tool handler, which is the only
+// way this is observable from outside now that AttachMCP builds the
+// handler itself — there is no longer a way to attach a bare
+// http.HandlerFunc that reads the context directly.
 func TestAuthenticateAllowsValidTokenAndPublishesIdentity(t *testing.T) {
 	idp := testidp.New(t)
 	var logs syncBuffer
@@ -217,43 +229,39 @@ func TestAuthenticateAllowsValidTokenAndPublishesIdentity(t *testing.T) {
 	t.Setenv("GANGWAY_PUBLIC_BASE_URL", "https://mcp.example.com")
 	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
 	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
-	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "160.79.104.0/21")
-	t.Setenv("GANGWAY_TRUSTED_PROXIES", "172.16.0.0/12")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "127.0.0.1/32,::1/128")
 
 	cfg, err := serve.LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	s, err := serve.New(context.Background(), cfg, serve.WithLogWriter(&logs))
+	gw, err := serve.New(context.Background(), cfg,
+		serve.WithLogWriter(&logs),
+		serve.WithToolKinds(map[string]access.ToolKind{"whoami-tool": access.KindRead}),
+	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-
-	var gotSubject string
-	var gotOK bool
-	s.AttachMCP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, ok := serve.IdentityFrom(r.Context())
-		gotOK = ok
-		if id != nil {
-			gotSubject = id.Subject
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
 
 	token := idp.Token(map[string]any{
 		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-42",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
-	w := request(t, s.Handler(), "172.20.0.5:5000", "160.79.104.1", token)
+	session := connectedClient(t, gw, newMCPServer(), token)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "whoami-tool"})
+	if err != nil {
+		t.Fatalf("CallTool(whoami-tool): %v", err)
 	}
-	if !gotOK {
-		t.Fatal("IdentityFrom reported no identity for an authenticated request")
+	if res.IsError {
+		t.Fatalf("result.IsError = true, want a successful call: %+v", res.Content)
 	}
-	if gotSubject != "user-42" {
-		t.Errorf("Subject = %q, want %q", gotSubject, "user-42")
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if text.Text != "user-42" {
+		t.Errorf("whoami-tool reported %q, want the authenticated subject %q", text.Text, "user-42")
 	}
 }
 
@@ -410,9 +418,7 @@ func TestNewSucceedsWithAWorkingRemoteAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	gw.AttachMCP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	gw.AttachMCP(stubMCPServer())
 
 	// No token is sent: a 401 (reached the authenticate layer) proves the
 	// origin gate let the request through; a 403 would mean the remote
@@ -504,14 +510,22 @@ func TestRunShutsDownGracefullyWhenContextIsCancelled(t *testing.T) {
 	}
 }
 
-// --- ToolMiddleware: end-to-end through a real MCP client ---
+// --- tool authorization: end-to-end through a real MCP client ---
 
-// newMCPServer builds a *mcp.Server carrying gw's tool-authorization
-// middleware and two tools: "read-tool" (classified as reading) and
-// "write-tool" (classified as writing). "mystery-tool" is deliberately
-// registered but left out of the classification gw was given, to exercise
-// the fail-closed default for tools nobody classified.
-func newMCPServer(gw *serve.Server) *mcp.Server {
+// newMCPServer builds a bare *mcp.Server with four tools: "read-tool"
+// (classified as reading by the tests that use it), "write-tool"
+// (classified as writing), "mystery-tool" (deliberately left out of
+// every classification, to exercise the fail-closed default for tools
+// nobody classified), and "whoami-tool" (reports the caller's identity
+// via IdentityFrom, for tests that check identity propagation).
+//
+// It does not touch tool-authorization middleware or build any HTTP
+// handler — AttachMCP owns both of those now, and does them for whatever
+// *mcp.Server it is given. Registering tools here and authorizing them
+// are deliberately two different servers' jobs: what newMCPServer builds
+// could equally well be served over stdio, with no gangway involved at
+// all.
+func newMCPServer() *mcp.Server {
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "gangway-test", Version: "0.0.0"}, nil)
 
 	respond := func(text string) func(context.Context, *mcp.CallToolRequest, noArgs) (*mcp.CallToolResult, any, error) {
@@ -522,22 +536,27 @@ func newMCPServer(gw *serve.Server) *mcp.Server {
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "read-tool"}, respond("read ok"))
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "write-tool"}, respond("write ok"))
 	mcp.AddTool(mcpServer, &mcp.Tool{Name: "mystery-tool"}, respond("mystery ok"))
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "whoami-tool"},
+		func(ctx context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, any, error) {
+			id, ok := serve.IdentityFrom(ctx)
+			if !ok {
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "no identity"}}}, nil, nil
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: id.Subject}}}, nil, nil
+		})
 
-	mcpServer.AddReceivingMiddleware(gw.ToolMiddleware())
 	return mcpServer
 }
 
-// connectedClient wires gw up to a real HTTP listener, connects an MCP
-// client to it over the streamable HTTP transport, and returns the
-// session together with everything needed for cleanup and log
-// inspection.
+// connectedClient attaches mcpServer to gw (AttachMCP installs the
+// tool-authorization middleware and builds the stateless HTTP handler),
+// serves it on a real HTTP listener, connects an MCP client to it over
+// the streamable HTTP transport, and returns the session together with
+// everything needed for cleanup and log inspection.
 func connectedClient(t *testing.T, gw *serve.Server, mcpServer *mcp.Server, token string) *mcp.ClientSession {
 	t.Helper()
 
-	gw.AttachMCP(mcp.NewStreamableHTTPHandler(
-		func(*http.Request) *mcp.Server { return mcpServer },
-		&mcp.StreamableHTTPOptions{Stateless: true},
-	))
+	gw.AttachMCP(mcpServer)
 
 	ts := httptest.NewServer(gw.Handler())
 	t.Cleanup(ts.Close)
@@ -592,7 +611,7 @@ func TestWriteToolWithoutRoleIsDeniedAtMCPLayer(t *testing.T) {
 		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-123",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
-	session := connectedClient(t, gw, newMCPServer(gw), token)
+	session := connectedClient(t, gw, newMCPServer(), token)
 
 	_, err = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "write-tool"})
 	if err == nil {
@@ -651,7 +670,7 @@ func TestReadToolIsAllowedForAnyAuthenticatedCaller(t *testing.T) {
 		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-123",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
-	session := connectedClient(t, gw, newMCPServer(gw), token)
+	session := connectedClient(t, gw, newMCPServer(), token)
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "read-tool"})
 	if err != nil {
@@ -694,7 +713,7 @@ func TestUnclassifiedToolDefaultsToWriteKind(t *testing.T) {
 		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-123",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
-	session := connectedClient(t, gw, newMCPServer(gw), token)
+	session := connectedClient(t, gw, newMCPServer(), token)
 
 	_, err = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "mystery-tool"})
 	if err == nil {
@@ -703,9 +722,9 @@ func TestUnclassifiedToolDefaultsToWriteKind(t *testing.T) {
 }
 
 // TestOptionsOverrideDefaults exercises WithDecider directly: swapping in
-// access.AllowAll must be visible in the ToolMiddleware's behaviour —
-// including for a tool that would otherwise be refused by the shipped
-// grid.
+// access.AllowAll must be visible in the tool-authorization middleware's
+// behaviour — including for a tool that would otherwise be refused by
+// the shipped grid.
 func TestOptionsOverrideDefaults(t *testing.T) {
 	idp := testidp.New(t)
 	var logs syncBuffer
@@ -731,7 +750,7 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-123",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
-	session := connectedClient(t, gw, newMCPServer(gw), token)
+	session := connectedClient(t, gw, newMCPServer(), token)
 
 	// write-tool would be refused under the default grid (see
 	// TestWriteToolWithoutRoleIsDeniedAtMCPLayer); under AllowAll it must

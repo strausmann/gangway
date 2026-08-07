@@ -24,21 +24,36 @@ import (
 // tool invocation. The SDK keeps its own copy of this string unexported
 // (it is only ever compared against, never constructed, by SDK-external
 // code), but the name itself is part of the wire protocol, not an SDK
-// implementation detail — duplicating it here is safe and lets
-// Server.ToolMiddleware recognise the one method it needs to inspect.
+// implementation detail — duplicating it here is safe and lets the
+// tool-authorization middleware recognise the one method it needs to
+// inspect.
 const methodCallTool = "tools/call"
 
-// CodeForbidden is the JSON-RPC error code Server.ToolMiddleware uses to
-// report a refused tool call. JSON-RPC 2.0 reserves -32000 to -32099 for
-// implementation-defined server errors; the SDK's own codes in that range
-// (see mcp.CodeHeaderMismatch and neighbours) stop at -32042, so -32001
-// does not collide with anything the SDK assigns itself.
-const CodeForbidden int64 = -32001
+// CodeForbidden is the JSON-RPC error code the tool-authorization
+// middleware (installed by AttachMCP) uses to report a refused tool
+// call. Per the SDK's own protocol documentation, -32000 to -32019 is
+// implementation-defined (the range third-party code should use) while
+// -32020 to -32099 is reserved for the MCP specification itself (see
+// mcp.CodeHeaderMismatch and neighbours, which live there). Within the
+// implementation-defined range, -32001, -32003, -32004 and -32005 are
+// already live internally in the SDK's jsonrpc2 layer (unknown error,
+// client/server closing, transport rejection) and could in principle
+// reach the wire; -32002 was CodeResourceNotFound's value before
+// SEP-2164 and can still appear under a documented compatibility flag.
+// -32010 avoids all of those.
+const CodeForbidden int64 = -32010
 
 // Server is an assembled, ready-to-run MCP server front end.
 //
 // A Server on its own only ever serves /healthz: without a call to
 // AttachMCP, the assembled handler has nothing to route /mcp requests to.
+// AttachMCP is the only way to wire an *mcp.Server into a Server, and it
+// leaves no way to end up with tool calls that bypass authorization: it
+// takes the bare *mcp.Server — before any HTTP handler has been built
+// from it — installs the tool-authorization middleware itself, and
+// builds the HTTP handler itself with stateless sessions forced on. A
+// caller cannot build that handler another way and hand it in instead;
+// there is no exported constructor for it that skips either step.
 type Server struct {
 	cfg       *Config
 	verifier  identity.Verifier
@@ -46,7 +61,7 @@ type Server struct {
 	logs      io.Writer
 	toolKinds map[string]access.ToolKind
 	list      origin.List
-	mcp       http.Handler // set by AttachMCP
+	mcp       http.Handler // built by AttachMCP from the *mcp.Server it receives
 }
 
 // Option adjusts the assembly.
@@ -58,16 +73,16 @@ func WithDecider(d access.Decider) Option { return func(s *Server) { s.decider =
 // WithLogWriter redirects the access log. Defaults to stdout.
 func WithLogWriter(w io.Writer) Option { return func(s *Server) { s.logs = w } }
 
-// WithToolKinds tells Server.ToolMiddleware how to classify tools by name
-// as reading or writing.
+// WithToolKinds tells the tool-authorization middleware installed by
+// AttachMCP how to classify tools by name as reading or writing.
 //
 // The SDK does not expose a registered tool's annotations to receiving
 // middleware — a tools/call request only ever carries the tool's name and
 // raw arguments, nothing about how the tool was registered. This mapping
-// is therefore the only way ToolMiddleware can tell a reading tool from a
-// writing one. A tool name absent from the map is treated as writing (see
-// ToolMiddleware): a forgotten entry must fail closed, not quietly permit
-// everyone to call a tool nobody classified.
+// is therefore the only way the middleware can tell a reading tool from a
+// writing one. A tool name absent from the map is treated as writing: a
+// forgotten entry must fail closed, not quietly permit everyone to call a
+// tool nobody classified.
 func WithToolKinds(kinds map[string]access.ToolKind) Option {
 	return func(s *Server) { s.toolKinds = kinds }
 }
@@ -146,42 +161,52 @@ func (s *Server) buildAllowList(ctx context.Context) (origin.List, error) {
 	return origin.Combine(lists...), nil
 }
 
-// AttachMCP installs the HTTP handler produced by the MCP SDK — typically
-// the result of mcp.NewStreamableHTTPHandler wrapping a *mcp.Server that
-// has Server.ToolMiddleware installed via AddReceivingMiddleware. Call it
-// before Handler or Run; Handler reads the attached handler once, when
-// called.
+// AttachMCP takes the bare MCP server — not yet wrapped in any HTTP
+// handler — and turns it into gw's /mcp endpoint. Call it before Handler
+// or Run; Handler reads the handler AttachMCP built, once, when called.
 //
-// See ToolMiddleware for a requirement on how that handler is built:
-// StreamableHTTPOptions.Stateless must be true.
-func (s *Server) AttachMCP(h http.Handler) { s.mcp = h }
+// AttachMCP owns two properties that must both hold and that no
+// caller-supplied handler could be trusted to have, so it does not offer
+// a way to supply one:
+//
+//  1. Every tool call runs through the authorization middleware. AttachMCP
+//     installs it itself (mcpServer.AddReceivingMiddleware(...)) — there is
+//     no separate step to forget.
+//  2. The server runs stateless (mcp.StreamableHTTPOptions.Stateless =
+//     true), hardcoded, not a caller-visible option. In a stateful
+//     session (the SDK's own default), the SDK dispatches every JSON-RPC
+//     message on that session — including a tools/call arriving on a
+//     POST long after the session was opened — through the single
+//     context captured once, when the session was created by the
+//     initialize request; a later request's own context (and, with it,
+//     the outcome tracker accesslog.Middleware attached to that specific
+//     HTTP request) never reaches the middleware. Stateless mode opens
+//     and closes one temporary session per HTTP request instead, so the
+//     context the middleware sees is always the current request's own.
+//     IdentityFrom and accesslog.MarkToolOutcome (see toolMiddleware)
+//     both depend on that: neither is wrong in stateful mode — the
+//     authorization decision itself is unaffected — but IdentityFrom
+//     could return a caller that authenticated the session rather than
+//     the one who sent this particular call, and the denial or approval
+//     the middleware records could attach to an access-log line for a
+//     request that already finished, invisible to anyone reading the
+//     log.
+//
+// Both are structural, not documented conventions: there is no exported
+// way to reach a *Server's /mcp handler that skips either one.
+func (s *Server) AttachMCP(mcpServer *mcp.Server) {
+	mcpServer.AddReceivingMiddleware(s.toolMiddleware())
+	s.mcp = mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return mcpServer },
+		&mcp.StreamableHTTPOptions{Stateless: true},
+	)
+}
 
-// ToolMiddleware returns the MCP receiving middleware that authorizes
-// each tool call. Install it on the *mcp.Server passed to AttachMCP's
-// handler, before wrapping that server in mcp.NewStreamableHTTPHandler
-// with StreamableHTTPOptions.Stateless set to true:
-//
-//	mcpServer.AddReceivingMiddleware(gw.ToolMiddleware())
-//	handler := mcp.NewStreamableHTTPHandler(getServer, &mcp.StreamableHTTPOptions{Stateless: true})
-//	gw.AttachMCP(handler)
-//
-// Stateless is not optional. In a stateful session (the SDK's own
-// default), the SDK dispatches every JSON-RPC message on that session —
-// including a tools/call arriving on a POST long after the session was
-// opened — through the single context captured once, when the session
-// was created by the initialize request; a later request's own context
-// (and, with it, the outcome tracker accesslog.Middleware attached to
-// that specific HTTP request) never reaches this middleware. In stateless
-// mode the SDK opens and closes one temporary session per HTTP request
-// (see StreamableHTTPOptions.Stateless), so the context this middleware
-// receives is always the current request's own. IdentityFrom and
-// accesslog.MarkToolOutcome below both depend on that: neither is wrong
-// in stateful mode — the authorization decision itself is unaffected —
-// but IdentityFrom can return a caller that authenticated the session
-// rather than the one who sent this particular call, and the denial or
-// approval this middleware records may attach to an access-log line for
-// a request that already finished, making it invisible to anyone
-// reading the log.
+// toolMiddleware returns the MCP receiving middleware that authorizes
+// each tool call. AttachMCP installs it; it is not exported because
+// AttachMCP is the only correct place to install it — see AttachMCP for
+// why (stateless sessions are what make the context this middleware
+// relies on trustworthy).
 //
 // Order matters at the HTTP layer (see Handler); at the MCP layer there
 // is exactly one concern to enforce, so no ordering question arises
@@ -195,7 +220,7 @@ func (s *Server) AttachMCP(h http.Handler) { s.mcp = h }
 // accesslog.MarkToolOutcome: without it, a refusal here would be
 // invisible to anything reading the access log for HTTP status codes
 // alone.
-func (s *Server) ToolMiddleware() mcp.Middleware {
+func (s *Server) toolMiddleware() mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			if method != methodCallTool {
@@ -238,7 +263,7 @@ func (s *Server) ToolMiddleware() mcp.Middleware {
 //	  origin gate     before the body is read
 //	    authenticate  before the MCP layer sees anything
 //	      MCP handler tool authorization lives inside, in SDK middleware
-//	                  (see ToolMiddleware)
+//	                  installed by AttachMCP (see toolMiddleware)
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -299,8 +324,8 @@ func identityInto(ctx context.Context, id *identity.Identity) context.Context {
 
 // IdentityFrom returns the verified caller placed into the context by the
 // HTTP authentication layer (see Server.Handler). Tools use it to learn
-// who is calling; Server.ToolMiddleware uses it to build the
-// authorization request.
+// who is calling; the tool-authorization middleware installed by
+// AttachMCP uses it to build the authorization request.
 func IdentityFrom(ctx context.Context) (*identity.Identity, bool) {
 	id, ok := ctx.Value(identityKey{}).(*identity.Identity)
 	return id, ok
