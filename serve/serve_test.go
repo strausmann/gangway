@@ -48,6 +48,29 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// waitForLogLine polls logs until it contains want or the timeout
+// elapses, returning whatever the buffer held at that point either way.
+//
+// The access log line for an end-to-end MCP call is written by the
+// server's own connection-handling goroutine, strictly after it finishes
+// writing the HTTP response — but the client can observe that same
+// response as complete, and return from CallTool, a few instructions
+// earlier: TCP delivery to the client's kernel does not wait for the
+// server-side handler to finish its own bookkeeping. A single immediate
+// check right after CallTool returns is therefore flaky (observed: about
+// 1 run in 15); polling with a short bound is not.
+func waitForLogLine(logs *syncBuffer, want string) string {
+	deadline := time.Now().Add(2 * time.Second)
+	var last string
+	for {
+		last = logs.String()
+		if strings.Contains(last, want) || time.Now().After(deadline) {
+			return last
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func newServer(t *testing.T, idp *testidp.IDP, logs *syncBuffer) http.Handler {
 	t.Helper()
 
@@ -588,11 +611,12 @@ func TestWriteToolWithoutRoleIsDeniedAtMCPLayer(t *testing.T) {
 	// The refusal happened inside the MCP layer: the HTTP status of the
 	// request that carried it is still 200, and the only place the
 	// refusal is visible from the outside is this field.
-	if !strings.Contains(logs.String(), `mcp_tool="write-tool" mcp_outcome="denied"`) {
-		t.Errorf("access log %q does not record the denial", logs.String())
+	line := waitForLogLine(&logs, `mcp_tool="write-tool" mcp_outcome="denied"`)
+	if !strings.Contains(line, `mcp_tool="write-tool" mcp_outcome="denied"`) {
+		t.Errorf("access log %q does not record the denial", line)
 	}
-	if !strings.Contains(logs.String(), ` 200 `) {
-		t.Errorf("access log %q does not show HTTP 200 for the refused call", logs.String())
+	if !strings.Contains(line, ` 200 `) {
+		t.Errorf("access log %q does not show HTTP 200 for the refused call", line)
 	}
 }
 
@@ -637,8 +661,9 @@ func TestReadToolIsAllowedForAnyAuthenticatedCaller(t *testing.T) {
 		t.Errorf("result.IsError = true, want a successful read")
 	}
 
-	if !strings.Contains(logs.String(), `mcp_tool="read-tool" mcp_outcome="allowed"`) {
-		t.Errorf("access log %q does not record the read as allowed", logs.String())
+	line := waitForLogLine(&logs, `mcp_tool="read-tool" mcp_outcome="allowed"`)
+	if !strings.Contains(line, `mcp_tool="read-tool" mcp_outcome="allowed"`) {
+		t.Errorf("access log %q does not record the read as allowed", line)
 	}
 }
 
