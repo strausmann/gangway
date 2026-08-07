@@ -2,9 +2,12 @@ package origin_test
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -206,5 +209,94 @@ func TestRemoteListStopsRefreshingWhenContextIsCancelled(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := calls.Load(); got != after {
 		t.Errorf("refresh kept running after context cancellation: %d calls at cancel, %d after waiting", after, got)
+	}
+}
+
+// closeErrTransport lets a test force every response body's Close to fail,
+// without needing the test server itself to misbehave: the read still
+// comes from the real transport's response, only Close is intercepted.
+type closeErrTransport struct {
+	base     http.RoundTripper
+	closeErr error
+}
+
+func (t *closeErrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &closeErrBody{ReadCloser: resp.Body, err: t.closeErr}
+	return resp, nil
+}
+
+type closeErrBody struct {
+	io.ReadCloser
+	err error
+}
+
+func (b *closeErrBody) Close() error {
+	_ = b.ReadCloser.Close()
+	return b.err
+}
+
+// closeErrText marks the simulated close failure so the two tests below
+// can tell, from the returned error's text, whether it actually surfaced
+// or was swallowed in favour of a more useful cause.
+const closeErrText = "simulated close failure"
+
+func clientWithCloseErr() *http.Client {
+	return &http.Client{Transport: &closeErrTransport{
+		base:     http.DefaultTransport,
+		closeErr: errors.New(closeErrText),
+	}}
+}
+
+func TestRemoteListSurfacesCloseErrorWhenNothingElseFailed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"prefixes":[{"ipv4Prefix":"198.51.100.0/24"}]}`))
+	}))
+	defer srv.Close()
+
+	// The fetch itself succeeds — status 200, a well-formed, non-empty
+	// list — but the response body fails to close. With nothing more
+	// useful to report, that close error is the only cause available and
+	// must be returned rather than discarded.
+	_, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
+		URL:      srv.URL,
+		Interval: time.Hour,
+		Parse:    origin.ParseOpenAIPrefixes,
+		Client:   clientWithCloseErr(),
+	})
+	if err == nil {
+		t.Fatal("want an error when the response body fails to close, got none")
+	}
+	if !strings.Contains(err.Error(), closeErrText) {
+		t.Errorf("error = %q, want it to mention the close failure (%q)", err.Error(), closeErrText)
+	}
+}
+
+func TestRemoteListSwallowsCloseErrorWhenAnotherErrorAlreadyWon(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	// The fetch fails for a real reason (non-200 status) AND the response
+	// body fails to close. A close error is administrative noise next to
+	// an actual fetch failure — it must not hide the more useful cause.
+	_, err := origin.NewRemoteList(context.Background(), origin.RemoteListConfig{
+		URL:      srv.URL,
+		Interval: time.Hour,
+		Parse:    origin.ParseOpenAIPrefixes,
+		Client:   clientWithCloseErr(),
+	})
+	if err == nil {
+		t.Fatal("want an error when the fetch fails, got none")
+	}
+	if strings.Contains(err.Error(), closeErrText) {
+		t.Errorf("error = %q, the close failure must stay hidden behind the status error", err.Error())
+	}
+	if !strings.Contains(err.Error(), "status 500") {
+		t.Errorf("error = %q, want it to mention the status failure", err.Error())
 	}
 }
