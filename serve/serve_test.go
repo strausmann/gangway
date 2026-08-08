@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -463,6 +464,62 @@ func TestNewFailsWhenNoAllowlistIsConfigured(t *testing.T) {
 	}
 }
 
+// TestNewFailsWithoutIssuerWhenWithVerifierIsNotUsed and
+// TestNewFailsWithoutAudienceWhenWithVerifierIsNotUsed are the
+// complementary proof for TestLoadConfigNoLongerRequiresIssuerOrAudience
+// (serve/config_test.go): LoadConfig no longer refuses a missing
+// GANGWAY_ISSUER_URL/GANGWAY_AUDIENCE, but that requirement did not
+// disappear — it moved one layer later, into New's default branch (see
+// resolveVerifier). A caller who does not use WithVerifier and leaves
+// either empty still cannot start a server.
+//
+// Both also guard the specific regression the move risked: New's default
+// branch could have let identity.NewOIDC's own check be the one that
+// fires, and that check names the Go field ("IssuerURL is required"),
+// not the environment variable an operator actually set — a worse error
+// message than LoadConfig used to give for the exact same misconfiguration.
+// resolveVerifier checks both itself first (see its own comment) so the
+// error an operator sees still names GANGWAY_ISSUER_URL/GANGWAY_AUDIENCE,
+// which is what these tests assert, not just "an error happened".
+func TestNewFailsWithoutIssuerWhenWithVerifierIsNotUsed(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		Audience:        "mcp-server",
+		SubjectClaim:    "sub",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+		// IssuerURL deliberately empty; no WithVerifier used.
+	}
+
+	_, err := serve.New(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("want an error when IssuerURL is missing and WithVerifier is not used, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_ISSUER_URL") {
+		t.Errorf("error = %q, want it to name GANGWAY_ISSUER_URL", err)
+	}
+}
+
+func TestNewFailsWithoutAudienceWhenWithVerifierIsNotUsed(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL: "https://mcp.example.com",
+		// IssuerURL need not resolve to anything real: resolveVerifier's
+		// own Audience check runs, and fails, before identity.NewOIDC
+		// would ever try to reach it.
+		IssuerURL:       "https://issuer.example.com",
+		SubjectClaim:    "sub",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+		// Audience deliberately empty; no WithVerifier used.
+	}
+
+	_, err := serve.New(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("want an error when Audience is missing and WithVerifier is not used, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_AUDIENCE") {
+		t.Errorf("error = %q, want it to name GANGWAY_AUDIENCE", err)
+	}
+}
+
 func TestNewFailsWhenRemoteAllowlistCannotBeFetched(t *testing.T) {
 	idp := testidp.New(t)
 	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -524,6 +581,262 @@ func TestNewSucceedsWithAWorkingRemoteAllowlist(t *testing.T) {
 	w := request(t, gw.Handler(), "203.0.113.5:5000", "", "")
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d (remote-listed address should reach the auth layer)", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// --- New: WithVerifier replaces the default OIDC verifier ---
+
+// stubVerifier is a minimal identity.Verifier for tests: a fixed lookup
+// table from raw token to the *identity.Identity it should produce,
+// standing in for whatever a real non-OIDC verifier would do (a static
+// token, an opaque token looked up in a database, a second identity
+// provider). A token not in the table is rejected the same way a real
+// Verifier rejects one it does not recognise: wrapping
+// identity.ErrUnauthenticated.
+type stubVerifier map[string]*identity.Identity
+
+func (s stubVerifier) Verify(_ context.Context, rawToken string) (*identity.Identity, error) {
+	id, ok := s[rawToken]
+	if !ok {
+		return nil, fmt.Errorf("%w: token not recognised by stubVerifier", identity.ErrUnauthenticated)
+	}
+	return id, nil
+}
+
+// TestWithVerifierReplacesTheDefaultOIDCVerifier is the end-to-end proof
+// that WithVerifier's verifier — not the default OIDC one New would
+// otherwise build — is what actually authenticates a caller: the
+// identity whoami-tool reports back is the stub's own, static subject,
+// which no OIDC verifier built from this cfg could ever produce, since
+// IssuerURL, Audience and SubjectClaim are all left unset. If New still
+// built the default OIDC verifier underneath WithVerifier, it would fail
+// right here — identity.NewOIDC refuses an empty IssuerURL — before the
+// assertions below ever ran.
+func TestWithVerifierReplacesTheDefaultOIDCVerifier(t *testing.T) {
+	verifier := stubVerifier{
+		"good-token": {Subject: "static-user", Claims: map[string]any{"sub": "static-user"}},
+	}
+
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "127.0.0.1/32", "::1/128"),
+	}
+
+	var logs syncBuffer
+	gw, err := serve.New(context.Background(), cfg,
+		serve.WithVerifier(verifier),
+		serve.WithLogWriter(&logs),
+		serve.WithToolKinds(map[string]access.ToolKind{"whoami-tool": access.KindRead}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	session := connectedClient(t, gw, newMCPServer(), "good-token")
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "whoami-tool"})
+	if err != nil {
+		t.Fatalf("CallTool(whoami-tool): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("result.IsError = true, want a successful call: %+v", res.Content)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if text.Text != "static-user" {
+		t.Errorf("whoami-tool reported %q, want the custom verifier's subject %q", text.Text, "static-user")
+	}
+}
+
+// TestWithVerifierRejectsATokenTheCustomVerifierDoesNotKnow proves the
+// stub verifier's own rejection reaches the same challenge path a failed
+// OIDC verification would: a token it does not recognise still ends in
+// 401, not a silent pass-through.
+func TestWithVerifierRejectsATokenTheCustomVerifierDoesNotKnow(t *testing.T) {
+	verifier := stubVerifier{
+		"good-token": {Subject: "static-user"},
+	}
+
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	var logs syncBuffer
+	gw, err := serve.New(context.Background(), cfg, serve.WithVerifier(verifier), serve.WithLogWriter(&logs))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.AttachMCP(stubMCPServer())
+
+	w := request(t, gw.Handler(), "160.79.104.1:5000", "", "an-unknown-token")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d for a token the custom verifier rejects", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestNewRejectsAnExplicitNilVerifier is the regression test for the
+// dangerous silent case: WithVerifier(nil) must never be mistaken for
+// "no option was given" and quietly fall back to the default OIDC
+// verifier, and must never leave the server with no verifier at all. New
+// refuses it outright, at construction time.
+func TestNewRejectsAnExplicitNilVerifier(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(nil))
+	if err == nil {
+		t.Fatal("want an error for WithVerifier(nil), got none")
+	}
+	if !strings.Contains(err.Error(), "WithVerifier") {
+		t.Errorf("error = %q, want it to mention WithVerifier", err)
+	}
+}
+
+// TestNewRejectsAnExplicitNilVerifierWithAFullyValidConfig is
+// TestNewRejectsAnExplicitNilVerifier's production-like counterpart. That
+// test's cfg carries an empty IssuerURL, so an error there proves less
+// than it looks like it does: even a New with the WithVerifier(nil)
+// rejection itself removed would still fail on that cfg, just from
+// identity.NewOIDC's own "IssuerURL is required" check — so a regression
+// that silently re-enabled the fallback to the default OIDC verifier
+// could hide behind an unrelated, coincidental error. This test removes
+// that ambiguity: a real test identity provider, every OIDC field set,
+// exactly what a caller who accidentally writes WithVerifier(nil) instead
+// of omitting the option would actually have running. If New silently
+// built the default OIDC verifier here instead of refusing, this test
+// would see no error at all — cfg is valid enough for identity.NewOIDC to
+// succeed on its own.
+func TestNewRejectsAnExplicitNilVerifierWithAFullyValidConfig(t *testing.T) {
+	idp := testidp.New(t)
+
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		IssuerURL:       idp.URL(),
+		Audience:        "mcp-server",
+		SubjectClaim:    "sub",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(nil))
+	if err == nil {
+		t.Fatal("want an error for WithVerifier(nil) even with a fully valid OIDC config, got none")
+	}
+	if !strings.Contains(err.Error(), "WithVerifier") {
+		t.Errorf("error = %q, want it to mention WithVerifier", err)
+	}
+}
+
+// nilPtrVerifier implements identity.Verifier on a pointer receiver that
+// dereferences the receiver. It exists only to construct a *typed* nil:
+// a nil *nilPtrVerifier wrapped in an identity.Verifier interface value
+// is, at the interface level, not equal to the bare nil literal — the
+// interface carries a concrete type (*nilPtrVerifier), only the pointer
+// itself is nil. A plain `s.verifier == nil` check does not catch this;
+// see TestNewRejectsATypedNilVerifier.
+type nilPtrVerifier struct{ token string }
+
+func (v *nilPtrVerifier) Verify(_ context.Context, rawToken string) (*identity.Identity, error) {
+	if rawToken != v.token { // panics here if v is nil: v.token dereferences the receiver
+		return nil, fmt.Errorf("%w: unrecognised token", identity.ErrUnauthenticated)
+	}
+	return &identity.Identity{Subject: "static-user"}, nil
+}
+
+// TestNewRejectsATypedNilVerifier is the regression test for the gap a
+// plain `verifier == nil` check leaves open: a caller who declares a
+// concrete pointer variable but never initialises it —
+// `var v *nilPtrVerifier; serve.WithVerifier(v)` — hands New an
+// identity.Verifier that is *not* the bare nil literal (it carries the
+// concrete type *nilPtrVerifier), so the WithVerifier(nil) check alone
+// would let it through. New must catch this too, not just wait for the
+// first real request to panic on the nil receiver inside Verify.
+func TestNewRejectsATypedNilVerifier(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	var v *nilPtrVerifier // typed nil: v != nil at the interface level once passed to WithVerifier
+	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(v))
+	if err == nil {
+		t.Fatal("want an error for a typed-nil verifier, got none")
+	}
+	if !strings.Contains(err.Error(), "WithVerifier") {
+		t.Errorf("error = %q, want it to mention WithVerifier", err)
+	}
+}
+
+// nilSliceVerifier, nilChanVerifier and nilFuncVerifier round out the set
+// of nilable kinds isNilVerifier's reflection-based check covers, beyond
+// the pointer case TestNewRejectsATypedNilVerifier already exercises and
+// the map case stubVerifier already provides (its zero value, a nil map,
+// serves that role in the table below — no separate type needed). None
+// of these three types verify anything real; each exists purely to
+// produce a nil value of its specific kind, wrapped in identity.Verifier,
+// for TestNewRejectsATypedNilVerifierForEveryNilableKind.
+type nilSliceVerifier []string
+
+func (nilSliceVerifier) Verify(context.Context, string) (*identity.Identity, error) {
+	return nil, fmt.Errorf("%w: nilSliceVerifier never actually verifies anything", identity.ErrUnauthenticated)
+}
+
+type nilChanVerifier chan struct{}
+
+func (nilChanVerifier) Verify(context.Context, string) (*identity.Identity, error) {
+	return nil, fmt.Errorf("%w: nilChanVerifier never actually verifies anything", identity.ErrUnauthenticated)
+}
+
+type nilFuncVerifier func(context.Context, string) (*identity.Identity, error)
+
+func (f nilFuncVerifier) Verify(ctx context.Context, rawToken string) (*identity.Identity, error) {
+	return f(ctx, rawToken) // panics if f is nil -- calling a nil func value
+}
+
+// TestNewRejectsATypedNilVerifierForEveryNilableKind is the table-driven
+// regression guard isNilVerifier's own doc comment promises but, before
+// this test existed, nothing actually enforced beyond the pointer case:
+// TestNewRejectsATypedNilVerifier alone proved New rejects one of the
+// five kinds isNilVerifier's switch checks (Pointer, Map, Slice, Chan,
+// Func -- Interface and UnsafePointer are excluded there as provably
+// unreachable, see isNilVerifier), leaving the other four asserted by
+// the doc comment but not actually guarded by any test. Removing, say,
+// the map case from that switch would not fail a single test -- exactly
+// the coverage gap a security check must not have. Each case below pairs
+// a nilable Go kind with a purpose-built type of that kind (see above and
+// stubVerifier), so that removing any one case from isNilVerifier's
+// switch fails precisely the matching subtest here, not a coincidental
+// one.
+func TestNewRejectsATypedNilVerifierForEveryNilableKind(t *testing.T) {
+	cases := []struct {
+		name     string
+		verifier identity.Verifier
+	}{
+		{"pointer", (*nilPtrVerifier)(nil)},
+		{"map", stubVerifier(nil)},
+		{"slice", nilSliceVerifier(nil)},
+		{"chan", nilChanVerifier(nil)},
+		{"func", nilFuncVerifier(nil)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			}
+
+			_, err := serve.New(context.Background(), cfg, serve.WithVerifier(tc.verifier))
+			if err == nil {
+				t.Fatalf("want an error for a nil %s verifier, got none", tc.name)
+			}
+			if !strings.Contains(err.Error(), "WithVerifier") {
+				t.Errorf("error = %q, want it to mention WithVerifier", err)
+			}
+		})
 	}
 }
 

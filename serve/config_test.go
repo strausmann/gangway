@@ -45,12 +45,29 @@ func TestLoadConfigRefusesMissingAllowlist(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRefusesMissingIssuer(t *testing.T) {
+// TestLoadConfigNoLongerRequiresIssuerOrAudience is the regression test
+// for the finding that LoadConfig used to enforce GANGWAY_ISSUER_URL and
+// GANGWAY_AUDIENCE even for a caller who uses serve.WithVerifier and
+// never reads either — see Config's field comment. Both are read into
+// the Config as-is, empty or not; LoadConfig itself no longer refuses
+// either being empty. serve/serve_test.go carries the complementary
+// proof that a caller who omits both WithVerifier and these two values
+// still fails to start, just one layer later, at serve.New — this test
+// only covers LoadConfig's own, narrower contract.
+func TestLoadConfigNoLongerRequiresIssuerOrAudience(t *testing.T) {
 	setMinimalEnv(t)
 	t.Setenv("GANGWAY_ISSUER_URL", "")
+	t.Setenv("GANGWAY_AUDIENCE", "")
 
-	if _, err := serve.LoadConfig(); err == nil {
-		t.Error("want an error when the issuer is missing, got none")
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.IssuerURL != "" {
+		t.Errorf("IssuerURL = %q, want empty", cfg.IssuerURL)
+	}
+	if cfg.Audience != "" {
+		t.Errorf("Audience = %q, want empty", cfg.Audience)
 	}
 }
 
@@ -83,19 +100,6 @@ func TestLoadConfigRefusesMissingPublicBaseURL(t *testing.T) {
 		t.Fatal("want an error when the public base URL is missing, got none")
 	}
 	if !strings.Contains(err.Error(), "GANGWAY_PUBLIC_BASE_URL") {
-		t.Errorf("error %q does not name the missing variable", err)
-	}
-}
-
-func TestLoadConfigRefusesMissingAudience(t *testing.T) {
-	setMinimalEnv(t)
-	t.Setenv("GANGWAY_AUDIENCE", "")
-
-	_, err := serve.LoadConfig()
-	if err == nil {
-		t.Fatal("want an error when the audience is missing, got none")
-	}
-	if !strings.Contains(err.Error(), "GANGWAY_AUDIENCE") {
 		t.Errorf("error %q does not name the missing variable", err)
 	}
 }

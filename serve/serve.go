@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,8 +142,18 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 // handler another way and hand it in instead; there is no exported
 // constructor for it that skips either step, for either attachment.
 type Server struct {
-	cfg        *Config
-	verifier   identity.Verifier
+	cfg *Config
+
+	verifier identity.Verifier
+	// verifierSet records whether WithVerifier ran, independently of
+	// what it set verifier to — verifier's own zero value (nil) cannot
+	// tell "WithVerifier was never called" apart from "WithVerifier(nil)
+	// was called", and resolveVerifier needs to tell those two apart:
+	// the first keeps the default OIDC verifier, the second is a
+	// caller error New must refuse. See WithVerifier and
+	// resolveVerifier.
+	verifierSet bool
+
 	decider    access.Decider
 	logs       io.Writer
 	toolKinds  map[string]access.ToolKind
@@ -171,6 +182,50 @@ type Option func(*Server)
 
 // WithDecider replaces the shipped read/write grid.
 func WithDecider(d access.Decider) Option { return func(s *Server) { s.decider = d } }
+
+// WithVerifier replaces the default OIDC verifier New would otherwise
+// build from cfg.IssuerURL, cfg.Audience and cfg.SubjectClaim.
+//
+// Use it when callers are not recognised by an OIDC bearer token verified
+// against an issuer's discovery document at all — a static token, an
+// opaque token looked up in a database, a second identity provider
+// Gangway has no built-in support for. Anything that implements
+// identity.Verifier works. Once this option is used, New never calls
+// identity.NewOIDC and never touches cfg.IssuerURL, cfg.Audience or
+// cfg.SubjectClaim — none of the three need to be set.
+//
+// This is the most security-sensitive extension point in the package:
+// using it redefines what "authenticated" means for this server. Gangway
+// trusts v's Verify implementation completely — it does not, and cannot,
+// second-guess a *Identity that Verify returns. Everything downstream
+// (serve.IdentityFrom, the tool-authorization middleware, the
+// GANGWAY_WRITERS_* grid or a replaced access.Decider) treats that
+// Identity as genuine. A Verify that accepts more than it should — one
+// that is too permissive about which tokens it recognises, or that
+// mishandles the "reject" path so it returns an Identity instead of an
+// error — grants exactly that access, with nothing in Gangway to catch
+// it. Writing a correct Verifier is the caller's responsibility; New only
+// guarantees that some non-nil Verifier is actually in place and gets
+// called (see the nil handling below), never the quality of what it
+// decides.
+//
+// v must not be nil. Omitting this option entirely is how a caller keeps
+// the default OIDC verifier; calling WithVerifier(nil) is a different,
+// and always mistaken, thing — no real Verifier is ever nil — and New
+// tells the two apart (see resolveVerifier) rather than treating a nil v
+// as "no option was given" and silently falling back to OIDC, or worse,
+// silently ending up with no verifier at all. A caller who ends up here
+// by accident — a variable that was supposed to hold a real Verifier but
+// turned out unset, say — gets a loud failure at startup instead of a
+// server that looks like it is checking tokens while every call to
+// Verify would in fact panic on a nil receiver, or, for an
+// interface-typed nil built some other way, could not be called at all.
+func WithVerifier(v identity.Verifier) Option {
+	return func(s *Server) {
+		s.verifier = v
+		s.verifierSet = true
+	}
+}
 
 // WithLogWriter redirects the access log. Defaults to stdout.
 //
@@ -224,21 +279,132 @@ func New(ctx context.Context, cfg *Config, opts ...Option) (*Server, error) {
 	}
 	s.logs = &syncWriter{w: s.logs}
 
-	var err error
-	s.verifier, err = identity.NewOIDC(ctx, identity.OIDCConfig{
-		IssuerURL:    cfg.IssuerURL,
-		Audience:     cfg.Audience,
-		SubjectClaim: cfg.SubjectClaim,
-	})
-	if err != nil {
+	if err := s.resolveVerifier(ctx, cfg); err != nil {
 		return nil, err
 	}
 
+	var err error
 	if s.list, err = s.buildAllowList(ctx); err != nil {
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// resolveVerifier settles s.verifier once every Option has already run.
+//
+// An explicit WithVerifier(nil) is refused outright — see WithVerifier
+// for why silently accepting it would be the exact failure mode this
+// whole package exists to prevent. No call to WithVerifier at all builds
+// the default OIDC verifier exactly as before WithVerifier existed:
+// nothing about adding this option changes behaviour for a caller that
+// never uses it. Any other call to WithVerifier has already placed its
+// verifier in s.verifier by the time this runs (see Option, applied in
+// New before this call) — resolveVerifier leaves it untouched; New must
+// never overwrite a caller's verifier with an OIDC one built underneath
+// it, which is exactly what unconditionally building the OIDC verifier
+// after applying options used to do.
+//
+// "refused outright" covers more than the bare nil literal: isNilVerifier
+// also catches a *typed* nil, such as a nil pointer that happens to
+// implement identity.Verifier — see isNilVerifier for why `s.verifier ==
+// nil` alone is not enough.
+func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
+	if s.verifierSet {
+		if isNilVerifier(s.verifier) {
+			return errors.New("gangway: WithVerifier(nil) is not a valid verifier " +
+				"— omit the option entirely to keep the default OIDC verifier")
+		}
+		return nil
+	}
+
+	// identity.NewOIDC below refuses an empty IssuerURL or Audience on its
+	// own — that check alone would be enough to keep New from starting
+	// with a half-configured OIDC verifier. But its error names the Go
+	// field ("IssuerURL is required"), because identity is a
+	// lower-level package with no notion of GANGWAY_* environment
+	// variables; used by itself, that is the right error to give. A
+	// caller who reached this code via serve.LoadConfig, though, set
+	// these through GANGWAY_ISSUER_URL and GANGWAY_AUDIENCE and would see
+	// an error that does not name either — LoadConfig used to check both
+	// itself and report exactly that, before the check moved here (see
+	// Config's field comment). Checking here too, before calling
+	// identity.NewOIDC, keeps that operator-facing wording: an operator
+	// missing an environment variable still gets told which one, not a
+	// Go field name they would have to translate back themselves.
+	if cfg.IssuerURL == "" {
+		return errors.New("gangway: GANGWAY_ISSUER_URL is required")
+	}
+	if cfg.Audience == "" {
+		return errors.New("gangway: GANGWAY_AUDIENCE is required")
+	}
+
+	v, err := identity.NewOIDC(ctx, identity.OIDCConfig{
+		IssuerURL:    cfg.IssuerURL,
+		Audience:     cfg.Audience,
+		SubjectClaim: cfg.SubjectClaim,
+	})
+	if err != nil {
+		return err
+	}
+	s.verifier = v
+	return nil
+}
+
+// isNilVerifier reports whether v would behave as if unset — panicking
+// or silently doing nothing useful — if resolveVerifier let it through.
+// A plain `v == nil` only catches the bare nil literal: an interface
+// value is nil exactly when *both* its type and its value are unset. It
+// is entirely possible to build a non-nil identity.Verifier whose
+// underlying value is still unusable — a caller who declares a concrete
+// pointer variable and forgets to initialise it, `var v *myVerifier;
+// serve.WithVerifier(v)`, hands New an interface value that carries a
+// concrete type (*myVerifier) and therefore is != nil, even though the
+// pointer itself is nil and calling Verify on it would dereference that
+// nil receiver.
+//
+// The same shape of mistake exists for any of Go's other nilable kinds —
+// a nil map, slice, channel, or func value wrapped in the interface — so
+// this checks each of them via reflection, not just pointers.
+// serve/serve_test.go's TestNewRejectsATypedNilVerifierForEveryNilableKind
+// exercises one purpose-built type per kind below, so that removing any
+// single case here — the map case, say — fails a specific test instead
+// of silently passing because every kind happened to be covered through
+// whichever one case an existing test used.
+//
+// Two kinds reflect.Kind defines are deliberately absent from the switch
+// below — not an oversight, and not merely unlikely, but structurally
+// impossible for any value that could ever reach here as an
+// identity.Verifier, so checking them would be dead code that looks like
+// coverage without being reachable:
+//
+//   - reflect.Interface: an interface value cannot itself hold another
+//     interface as its dynamic type. Assigning any value to an
+//     interface-typed variable (v identity.Verifier, then v to the `any`
+//     reflect.ValueOf takes) always stores that value's already-concrete
+//     dynamic type — reflect.ValueOf(v).Kind() can never report
+//     Interface here.
+//   - reflect.UnsafePointer: this Kind is only ever reported for a value
+//     of a defined type whose underlying type is unsafe.Pointer itself
+//     — and Go's method-declaration rules refuse a receiver of that
+//     shape outright (`invalid receiver type T (unsafe.Pointer)`, a
+//     compiler error, verified directly rather than assumed). No type
+//     with that underlying type can ever implement identity.Verifier's
+//     Verify method in the first place, so no value of it can ever be
+//     handed to WithVerifier.
+func isNilVerifier(v identity.Verifier) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		return rv.IsNil()
+	default:
+		// A struct value, an int, anything else that cannot be nil in
+		// the first place: nothing more to check.
+		return false
+	}
 }
 
 // buildAllowList assembles the configured allowlist once, at New time.
