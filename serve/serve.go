@@ -389,10 +389,10 @@ func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
 // Verify on it would dereference that nil receiver.
 //
 // The actual reflection-based check — which nilable kinds it covers, and
-// the proof that the two kinds it deliberately does not check
-// (reflect.Interface, reflect.UnsafePointer) can never occur here — lives
-// in nilguard.IsNilValue, shared with the equivalent checks for
-// WithDecider, WithLogWriter, accesslog.Middleware and origin.Combine.
+// why reflect.Interface is the only one of reflect's Kinds it does not
+// need to check — lives in nilguard.IsNilValue, shared with the
+// equivalent checks for WithDecider, WithLogWriter, accesslog.Middleware,
+// origin.Combine and origin.Gate.
 // serve/serve_test.go's TestNewRejectsATypedNilVerifierForEveryNilableKind
 // exercises one purpose-built type per nilable kind, so that removing any
 // single case from nilguard.IsNilValue's switch fails a specific subtest

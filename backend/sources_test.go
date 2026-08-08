@@ -48,6 +48,36 @@ func TestPerUserPropagatesLookupError(t *testing.T) {
 	}
 }
 
+// TestPerUserPanicsOnANilLookup is PerUser's version of the same
+// construction-time guard Combine, Gate and Middleware already have: a
+// nil lookup constructs a TokenSource that looks fine and panics only on
+// its first real TokenFor call — perUser.TokenFor calls p.lookup(ctx, id)
+// unconditionally, a nil-func-value call, the same shape of "works until
+// the first request" failure this whole hardening effort exists to move
+// earlier.
+//
+// Unlike WithDecider/WithLogWriter/Combine/Gate, this check does not need
+// nilguard.IsNilValue's reflection: lookup's own parameter type is a bare
+// func, not an interface a caller could satisfy with some other nilable
+// kind wrapped inside it. There is no typed-nil-behind-an-interface case
+// to miss here — a func value compared directly with nil is already
+// unambiguous, so the simpler comparison is not a shortcut, it is the
+// complete check for this parameter shape.
+func TestPerUserPanicsOnANilLookup(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("want a panic for PerUser(nil), got none")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "PerUser") {
+			t.Errorf("recovered panic = %#v, want a string mentioning PerUser", r)
+		}
+	}()
+
+	backend.PerUser(nil)
+}
+
 func TestPassThrough(t *testing.T) {
 	got, err := backend.PassThrough().TokenFor(context.Background(), caller, "incoming-token")
 	if err != nil {

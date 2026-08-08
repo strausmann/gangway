@@ -452,10 +452,12 @@ type funcList func(netip.Addr) bool
 
 func (f funcList) Contains(addr netip.Addr) bool { return f(addr) } // panics if f is nil -- calling a nil func value
 
-// mustPanicOnCombine runs fn (expected to call origin.Combine) and
-// reports the recovered panic value, or fails the test if fn returned
-// normally.
-func mustPanicOnCombine(t *testing.T, fn func()) (recovered any) {
+// mustPanic runs fn (expected to call a construction-time guard such as
+// origin.Combine or origin.Gate) and reports the recovered panic value,
+// or fails the test if fn returned normally. Shared with gate_test.go —
+// both guard the same package's nil-List checks and want the identical
+// recover-and-report shape.
+func mustPanic(t *testing.T, fn func()) (recovered any) {
 	t.Helper()
 	defer func() {
 		recovered = recover()
@@ -493,7 +495,7 @@ func TestCombinePanicsOnANilListForEveryNilableKind(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.wantPanic {
-				r := mustPanicOnCombine(t, func() { origin.Combine(tc.list) })
+				r := mustPanic(t, func() { origin.Combine(tc.list) })
 				msg, ok := r.(string)
 				if !ok || !strings.Contains(msg, "Combine") {
 					t.Errorf("recovered panic = %#v, want a string mentioning Combine", r)
@@ -517,7 +519,7 @@ func TestCombinePanicsOnANilListAmongValidOnes(t *testing.T) {
 	valid1 := origin.Static(mustPrefixes(t, "160.79.104.0/21"))
 	valid2 := origin.Static(mustPrefixes(t, "10.0.0.0/8"))
 
-	r := mustPanicOnCombine(t, func() { origin.Combine(valid1, nil, valid2) })
+	r := mustPanic(t, func() { origin.Combine(valid1, nil, valid2) })
 	msg, ok := r.(string)
 	if !ok || !strings.Contains(msg, "Combine") {
 		t.Errorf("recovered panic = %#v, want a string mentioning Combine", r)

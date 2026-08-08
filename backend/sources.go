@@ -30,7 +30,21 @@ type perUser struct {
 
 // PerUser resolves a credential per caller. The lookup is where the
 // server maps an identity onto its own account model.
+//
+// PerUser panics if lookup is nil, at construction, rather than
+// returning a TokenSource that looks fine and panics on its first real
+// call — perUser.TokenFor calls lookup unconditionally, so a nil lookup
+// would otherwise fail on whichever request happened to be first,
+// instead of here, before the server is even built. This does not need
+// nilguard.IsNilValue's reflection the way WithDecider, WithLogWriter,
+// origin.Combine and origin.Gate do: lookup's parameter type is a bare
+// func, not an interface a caller could satisfy with some other nilable
+// kind hidden inside it, so there is no typed-nil case a plain `== nil`
+// could miss here.
 func PerUser(lookup func(context.Context, *identity.Identity) (string, error)) TokenSource {
+	if lookup == nil {
+		panic("gangway: backend.PerUser: lookup is required")
+	}
 	return &perUser{lookup: lookup}
 }
 

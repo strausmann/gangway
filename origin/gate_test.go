@@ -176,6 +176,50 @@ func TestGatePanicsWithoutAnAllowList(t *testing.T) {
 	})
 }
 
+// TestGatePanicsOnATypedNilAllowListForEveryNilableKind is the
+// table-driven regression guard for the gap the review found: Gate's
+// nil check used to be the bare `cfg.Allow == nil` its own doc comment
+// still describes as the reason it panics at all, which only catches the
+// literal nil case TestGatePanicsWithoutAnAllowList already covers. A
+// typed nil List — a caller's own List implementation, declared but never
+// assigned — reached Gate unrejected under that check and panicked later,
+// inside the first real request's call to cfg.Allow.Contains, exactly the
+// failure mode Gate's own doc comment says it exists to prevent. Gate now
+// uses the same nilguard.IsNilValue check as origin.Combine; this table
+// mirrors TestCombinePanicsOnANilListForEveryNilableKind, reusing the
+// same purpose-built List types from list_test.go (same package).
+func TestGatePanicsOnATypedNilAllowListForEveryNilableKind(t *testing.T) {
+	cases := []struct {
+		name      string
+		allow     origin.List
+		wantPanic bool
+	}{
+		{"valid list", origin.Static(mustPrefixes(t, "160.79.104.0/21")), false},
+		{"pointer", (*nilPtrList)(nil), true},
+		{"map", mapList(nil), true},
+		{"slice", sliceList(nil), true},
+		{"chan", chanList(nil), true},
+		{"func", funcList(nil), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantPanic {
+				r := mustPanic(t, func() {
+					origin.Gate(origin.GateConfig{Mode: origin.ModeXForwardedFor, Allow: tc.allow})
+				})
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "GateConfig.Allow") {
+					t.Errorf("recovered panic = %#v, want a string mentioning GateConfig.Allow", r)
+				}
+				return
+			}
+			// Must not panic on construction.
+			origin.Gate(origin.GateConfig{Mode: origin.ModeXForwardedFor, Allow: tc.allow})
+		})
+	}
+}
+
 func TestGateWithoutOnRejectDoesNotPanic(t *testing.T) {
 	h := origin.Gate(origin.GateConfig{
 		Allow: origin.Static(nil),
