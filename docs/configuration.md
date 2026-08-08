@@ -134,7 +134,7 @@ server that answers requests while never checking anyone.
 
     import (
     	"context"
-    	"errors"
+    	"fmt"
     	"log"
     	"net/netip"
 
@@ -153,7 +153,17 @@ server that answers requests while never checking anyone.
 
     func (v staticTokenVerifier) Verify(_ context.Context, rawToken string) (*identity.Identity, error) {
     	if rawToken != v.token {
-    		return nil, errors.New("gangway: unrecognised token")
+    		// Wraps identity.ErrUnauthenticated, exactly as the built-in
+    		// OIDC verifier's own failures do: a caller of Verify -- code
+    		// outside this package, not just Gangway's own authenticate
+    		// layer -- can then tell "this token was rejected" apart from
+    		// some other failure (a database a real verifier looks a token
+    		// up against being unreachable, say) via errors.Is. An error
+    		// that does not wrap it breaks that contract silently: nothing
+    		// here would fail to compile or even to run, it would just
+    		// make every failure of this Verifier indistinguishable from
+    		// a rejected token to any caller relying on errors.Is.
+    		return nil, fmt.Errorf("%w: unrecognised token", identity.ErrUnauthenticated)
     	}
     	return v.id, nil
     }
