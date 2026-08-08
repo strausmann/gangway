@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/strausmann/gangway/internal/nilguard"
 )
 
 // List decides whether an address is allowed to reach the server.
@@ -30,7 +32,38 @@ func (l *staticList) Contains(addr netip.Addr) bool { return inAny(addr, l.prefi
 type combined struct{ lists []List }
 
 // Combine allows an address that any of the given lists allows.
-func Combine(lists ...List) List { return &combined{lists: lists} }
+//
+// Combine panics if any element of lists is nil — in every sense
+// nilguard.IsNilValue checks, not just the bare nil literal — because
+// combined.Contains loops over every list and calls l.Contains(addr)
+// unconditionally: a nil element there panics on the first lookup that
+// reaches it, at whatever later moment a real request happens to trigger
+// it, rather than here, at construction, where the mistake is both
+// obvious and cheap to fix. This mirrors Gate's own cfg.Allow == nil
+// check in this same package, extended (via nilguard.IsNilValue rather
+// than a bare comparison) to also catch a typed nil — a concrete List
+// implementation's pointer variable that was declared but never
+// assigned, say — the bare comparison alone would miss.
+//
+// Calling Combine with zero lists is a different case, deliberately not
+// treated the same way: it is not nil, does not panic, and returns a
+// List that simply denies every address — a union over no lists is a
+// well-defined, if unusual, list, not a caller mistake on the same
+// footing as a nil element buried among otherwise valid ones.
+// serve.buildAllowList already refuses this case one level up, before
+// ever calling Combine (LoadConfig requires at least a static or a
+// remote allowlist) — that check exists there because "no allowlist
+// configured at all" is a decision about the server's own configuration,
+// not about what Combine, as a general-purpose list combinator, should
+// assume about every caller's intent.
+func Combine(lists ...List) List {
+	for i, l := range lists {
+		if nilguard.IsNilValue(l) {
+			panic(fmt.Sprintf("gangway: origin.Combine: lists[%d] is nil", i))
+		}
+	}
+	return &combined{lists: lists}
+}
 
 func (c *combined) Contains(addr netip.Addr) bool {
 	for _, l := range c.lists {

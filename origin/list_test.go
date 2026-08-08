@@ -373,3 +373,155 @@ func TestRemoteListErrorNeverLeaksURLPathOrQuery(t *testing.T) {
 		assertNoLeak(t, err)
 	})
 }
+
+// --- Combine: what "empty" means for a variadic []List ---
+//
+// Combine(lists ...List) has two structurally different "empty" cases,
+// and they behave differently on purpose — see each test below for which
+// is which and why:
+//
+//  1. No arguments at all (or, equivalently from inside Combine, an
+//     explicitly empty/nil []List spread with `...`): NOT a nilguard
+//     case, does not panic. A union over zero lists is a valid, if
+//     unusual, list that denies every address — see
+//     TestCombineWithNoListsDeniesEveryAddress.
+//  2. A nil List *value* among the arguments: today, calling Contains on
+//     the combined list panics the moment it reaches that nil element
+//     (a plain interface-method call on nil), because combined.Contains
+//     loops over every list and calls l.Contains(addr) unconditionally.
+//     Combine now refuses this eagerly, at construction, instead of
+//     leaving it for whichever future Contains call happens to be the
+//     first to reach the nil element — see
+//     TestCombinePanicsOnANilListForEveryNilableKind and
+//     TestCombinePanicsOnANilListAmongValidOnes.
+
+// TestCombineWithNoListsDeniesEveryAddress pins case 1 above: Combine()
+// must keep returning a List that simply denies everyone, not start
+// panicking or erroring just because it was handed nothing to combine.
+// serve.buildAllowList already refuses to call Combine with zero lists at
+// all (LoadConfig requires at least a static or a remote allowlist), so
+// this behaviour is only ever observable through a direct, hand-built
+// call to Combine — but Combine's own contract must still be explicit
+// about it, not merely "whatever the loop happens to do".
+func TestCombineWithNoListsDeniesEveryAddress(t *testing.T) {
+	l := origin.Combine()
+	if l == nil {
+		t.Fatal("Combine() = nil, want a non-nil List")
+	}
+	if l.Contains(netip.MustParseAddr("160.79.104.1")) {
+		t.Error("Combine() with no lists accepted an address; want it to deny every address")
+	}
+}
+
+// nilPtrList implements origin.List on a pointer receiver that
+// dereferences the receiver, purely to construct a *typed* nil: a nil
+// *nilPtrList wrapped in an origin.List interface value is, at the
+// interface level, not equal to the bare nil literal — the interface
+// carries a concrete type (*nilPtrList), only the pointer itself is nil.
+// A plain `l == nil` check inside Combine's loop would not catch this;
+// see TestCombinePanicsOnANilListForEveryNilableKind.
+type nilPtrList struct{ prefixes []netip.Prefix }
+
+func (l *nilPtrList) Contains(addr netip.Addr) bool {
+	for _, p := range l.prefixes { // panics here if l is nil: l.prefixes dereferences the receiver
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// mapList, sliceList, chanList and funcList round out the set of nilable
+// kinds the shared nilguard check covers. None of these decide anything
+// real; each exists purely to produce a nil value of its specific kind,
+// wrapped in origin.List, for
+// TestCombinePanicsOnANilListForEveryNilableKind.
+type mapList map[string]bool
+
+func (mapList) Contains(netip.Addr) bool { return false }
+
+type sliceList []string
+
+func (sliceList) Contains(netip.Addr) bool { return false }
+
+type chanList chan struct{}
+
+func (chanList) Contains(netip.Addr) bool { return false }
+
+type funcList func(netip.Addr) bool
+
+func (f funcList) Contains(addr netip.Addr) bool { return f(addr) } // panics if f is nil -- calling a nil func value
+
+// mustPanic runs fn (expected to call a construction-time guard such as
+// origin.Combine or origin.Gate) and reports the recovered panic value,
+// or fails the test if fn returned normally. Shared with gate_test.go —
+// both guard the same package's nil-List checks and want the identical
+// recover-and-report shape.
+func mustPanic(t *testing.T, fn func()) (recovered any) {
+	t.Helper()
+	defer func() {
+		recovered = recover()
+		if recovered == nil {
+			t.Fatal("want a panic, got none")
+		}
+	}()
+	fn()
+	return nil
+}
+
+// TestCombinePanicsOnANilListForEveryNilableKind is the table-driven
+// regression guard for case 2 above: a valid list (this table's own
+// regression guard — TestCombineMatchesAnyList already exercises the
+// happy path end-to-end, but a table mixing pass and fail cases needs its
+// own passing row too) alongside a purpose-built nil of every kind the
+// shared nilguard check covers, so that removing any one case from that
+// check fails precisely the matching subtest here — mirroring
+// TestNewRejectsATypedNilVerifierForEveryNilableKind in package serve.
+func TestCombinePanicsOnANilListForEveryNilableKind(t *testing.T) {
+	cases := []struct {
+		name      string
+		list      origin.List
+		wantPanic bool
+	}{
+		{"valid list", origin.Static(mustPrefixes(t, "160.79.104.0/21")), false},
+		{"bare nil literal", nil, true},
+		{"pointer", (*nilPtrList)(nil), true},
+		{"map", mapList(nil), true},
+		{"slice", sliceList(nil), true},
+		{"chan", chanList(nil), true},
+		{"func", funcList(nil), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantPanic {
+				r := mustPanic(t, func() { origin.Combine(tc.list) })
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "Combine") {
+					t.Errorf("recovered panic = %#v, want a string mentioning Combine", r)
+				}
+				return
+			}
+			l := origin.Combine(tc.list)
+			// Must not panic on construction, and the result must still
+			// work as a real list.
+			l.Contains(netip.MustParseAddr("160.79.104.1"))
+		})
+	}
+}
+
+// TestCombinePanicsOnANilListAmongValidOnes proves the check inspects
+// every element, not just lists[0]: a nil buried between two otherwise
+// valid lists is exactly the shape a caller assembling a []List
+// programmatically (appending one entry per configured source, say) could
+// produce by accident if one source's list ended up unset.
+func TestCombinePanicsOnANilListAmongValidOnes(t *testing.T) {
+	valid1 := origin.Static(mustPrefixes(t, "160.79.104.0/21"))
+	valid2 := origin.Static(mustPrefixes(t, "10.0.0.0/8"))
+
+	r := mustPanic(t, func() { origin.Combine(valid1, nil, valid2) })
+	msg, ok := r.(string)
+	if !ok || !strings.Contains(msg, "Combine") {
+		t.Errorf("recovered panic = %#v, want a string mentioning Combine", r)
+	}
+}

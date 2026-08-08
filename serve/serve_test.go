@@ -1240,6 +1240,326 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 	}
 }
 
+// --- New: WithDecider rejects a nil decider ---
+
+// TestNewRejectsAnExplicitNilDecider is WithDecider's counterpart to
+// TestNewRejectsAnExplicitNilVerifier: unlike the verifier, New always
+// assigns a default decider (access.NewGrid, built from cfg) before any
+// Option runs, so there is no "was WithDecider ever called" flag to
+// consult here — WithDecider(nil) simply overwrites that default with
+// nil, and New must catch that before a request ever reaches
+// s.decider.Allow and panics on a nil interface method call.
+func TestNewRejectsAnExplicitNilDecider(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	_, err := serve.New(context.Background(), cfg, serve.WithDecider(nil))
+	if err == nil {
+		t.Fatal("want an error for WithDecider(nil), got none")
+	}
+	if !strings.Contains(err.Error(), "WithDecider") {
+		t.Errorf("error = %q, want it to mention WithDecider", err)
+	}
+}
+
+// nilPtrDecider implements access.Decider on a pointer receiver that
+// dereferences the receiver, purely to construct a *typed* nil: a nil
+// *nilPtrDecider wrapped in an access.Decider interface value is, at the
+// interface level, not equal to the bare nil literal — the interface
+// carries a concrete type (*nilPtrDecider), only the pointer itself is
+// nil. A plain `s.decider == nil` check does not catch this; see
+// TestNewRejectsATypedNilDeciderForEveryNilableKind.
+type nilPtrDecider struct{ allow bool }
+
+func (d *nilPtrDecider) Allow(_ context.Context, _ access.Request) error {
+	if !d.allow { // panics here if d is nil: d.allow dereferences the receiver
+		return access.ErrForbidden
+	}
+	return nil
+}
+
+// mapDecider, sliceDecider, chanDecider and funcDecider round out the set
+// of nilable kinds the shared nilguard.IsNilValue check covers, mirroring
+// identity.Verifier's nilSliceVerifier/nilChanVerifier/nilFuncVerifier in
+// this same file. None of these decide anything real; each exists purely
+// to produce a nil value of its specific kind, wrapped in access.Decider,
+// for TestNewRejectsATypedNilDeciderForEveryNilableKind.
+type mapDecider map[string]bool
+
+func (mapDecider) Allow(context.Context, access.Request) error { return access.ErrForbidden }
+
+type sliceDecider []string
+
+func (sliceDecider) Allow(context.Context, access.Request) error { return access.ErrForbidden }
+
+type chanDecider chan struct{}
+
+func (chanDecider) Allow(context.Context, access.Request) error { return access.ErrForbidden }
+
+type funcDecider func(context.Context, access.Request) error
+
+func (f funcDecider) Allow(ctx context.Context, req access.Request) error {
+	return f(ctx, req) // panics if f is nil -- calling a nil func value
+}
+
+// TestNewRejectsATypedNilDeciderForEveryNilableKind is the table-driven
+// regression guard for WithDecider, structured exactly like
+// TestNewRejectsATypedNilVerifierForEveryNilableKind: a valid decider
+// (access.AllowAll — already exercised end-to-end by
+// TestOptionsOverrideDefaults, included again here purely as this table's
+// own regression guard) alongside a purpose-built nil of every kind
+// nilguard.IsNilValue checks, so that removing any one case from that
+// shared check fails precisely the matching subtest here.
+func TestNewRejectsATypedNilDeciderForEveryNilableKind(t *testing.T) {
+	// The nil-decider check must run before resolveVerifier's own
+	// checks (see New's field order) so that a minimal cfg still surfaces
+	// the WithDecider error specifically, not a coincidental
+	// "GANGWAY_ISSUER_URL is required" from the unrelated default OIDC
+	// path -- the exact ambiguity
+	// TestNewRejectsAnExplicitNilVerifierWithAFullyValidConfig documents
+	// for the verifier case. The "valid decider" row is the one exception:
+	// proving New actually succeeds needs OIDC to succeed too, so it gets
+	// a real test identity provider instead of the minimal cfg.
+	idp := testidp.New(t)
+
+	cases := []struct {
+		name    string
+		decider access.Decider
+		cfg     *serve.Config
+		wantErr bool
+	}{
+		{
+			name:    "valid decider",
+			decider: access.AllowAll(),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				IssuerURL:       idp.URL(),
+				Audience:        "mcp-server",
+				SubjectClaim:    "sub",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: false,
+		},
+		{
+			name:    "pointer",
+			decider: (*nilPtrDecider)(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:    "map",
+			decider: mapDecider(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:    "slice",
+			decider: sliceDecider(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:    "chan",
+			decider: chanDecider(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:    "func",
+			decider: funcDecider(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := serve.New(context.Background(), tc.cfg, serve.WithDecider(tc.decider))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error for a nil %s decider, got none", tc.name)
+				}
+				if !strings.Contains(err.Error(), "WithDecider") {
+					t.Errorf("error = %q, want it to mention WithDecider", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New with a valid decider: %v", err)
+			}
+		})
+	}
+}
+
+// --- New: WithLogWriter rejects a nil writer ---
+
+// TestNewRejectsAnExplicitNilLogWriter is WithLogWriter's counterpart to
+// TestNewRejectsAnExplicitNilDecider: New always assigns a default writer
+// (os.Stdout) before any Option runs, so WithLogWriter(nil) simply
+// overwrites that default with nil, and New must catch it before it gets
+// wrapped in a *syncWriter — see resolveLogWriter's doc comment for why
+// checking after that wrap would be too late to matter.
+func TestNewRejectsAnExplicitNilLogWriter(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	_, err := serve.New(context.Background(), cfg, serve.WithLogWriter(nil))
+	if err == nil {
+		t.Fatal("want an error for WithLogWriter(nil), got none")
+	}
+	if !strings.Contains(err.Error(), "WithLogWriter") {
+		t.Errorf("error = %q, want it to mention WithLogWriter", err)
+	}
+}
+
+// nilPtrWriter implements io.Writer on a pointer receiver that
+// dereferences the receiver, purely to construct a *typed* nil: a nil
+// *nilPtrWriter wrapped in an io.Writer interface value is, at the
+// interface level, not equal to the bare nil literal — the interface
+// carries a concrete type (*nilPtrWriter), only the pointer itself is
+// nil. A plain `s.logs == nil` check does not catch this; see
+// TestNewRejectsATypedNilLogWriterForEveryNilableKind.
+type nilPtrWriter struct{ buf bytes.Buffer }
+
+func (w *nilPtrWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p) // panics here if w is nil: w.buf dereferences the receiver
+}
+
+// mapWriter, sliceWriter, chanWriter and funcWriter round out the set of
+// nilable kinds the shared nilguard.IsNilValue check covers, mirroring
+// nilPtrDecider's siblings above. None of these write anything real; each
+// exists purely to produce a nil value of its specific kind, wrapped in
+// io.Writer, for TestNewRejectsATypedNilLogWriterForEveryNilableKind.
+type mapWriter map[string]int
+
+func (mapWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type sliceWriter []byte
+
+func (sliceWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type chanWriter chan struct{}
+
+func (chanWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type funcWriter func([]byte) (int, error)
+
+func (f funcWriter) Write(p []byte) (int, error) { return f(p) } // panics if f is nil -- calling a nil func value
+
+// TestNewRejectsATypedNilLogWriterForEveryNilableKind is the table-driven
+// regression guard for WithLogWriter, structured exactly like
+// TestNewRejectsATypedNilDeciderForEveryNilableKind: a real, usable
+// writer (a plain *bytes.Buffer, this table's own regression guard)
+// alongside a purpose-built nil of every kind nilguard.IsNilValue checks.
+func TestNewRejectsATypedNilLogWriterForEveryNilableKind(t *testing.T) {
+	// See TestNewRejectsATypedNilDeciderForEveryNilableKind's comment on
+	// why the valid case alone needs a real test identity provider: only
+	// that row needs New to actually succeed end-to-end.
+	idp := testidp.New(t)
+
+	cases := []struct {
+		name    string
+		writer  io.Writer
+		cfg     *serve.Config
+		wantErr bool
+	}{
+		{
+			name:   "valid writer",
+			writer: &bytes.Buffer{},
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				IssuerURL:       idp.URL(),
+				Audience:        "mcp-server",
+				SubjectClaim:    "sub",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: false,
+		},
+		{
+			name:   "pointer",
+			writer: (*nilPtrWriter)(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:   "map",
+			writer: mapWriter(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:   "slice",
+			writer: sliceWriter(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:   "chan",
+			writer: chanWriter(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+		{
+			name:   "func",
+			writer: funcWriter(nil),
+			cfg: &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := serve.New(context.Background(), tc.cfg, serve.WithLogWriter(tc.writer))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error for a nil %s log writer, got none", tc.name)
+				}
+				if !strings.Contains(err.Error(), "WithLogWriter") {
+					t.Errorf("error = %q, want it to mention WithLogWriter", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New with a valid log writer: %v", err)
+			}
+		})
+	}
+}
+
 // --- discovery: the reference a 401 hands out must actually resolve ---
 
 // TestChallengePointsToAFetchableMetadataDocument is the regression test

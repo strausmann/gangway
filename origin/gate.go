@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/netip"
+
+	"github.com/strausmann/gangway/internal/nilguard"
 )
 
 type ctxKey struct{}
@@ -31,13 +33,20 @@ type GateConfig struct {
 // Gate refuses requests from addresses that are not allowed, before the
 // body is read. On success the verified address is placed in the context.
 //
-// Gate panics if cfg.Allow is nil. That is a caller mistake, not a runtime
-// condition: without an allowlist there is nothing to check against, so
-// every request would either be refused outright or crash the handler on
-// its first invocation — a failure that must surface when the server is
-// built, not silently in production on the first request that arrives.
+// Gate panics if cfg.Allow is nil — in every sense nilguard.IsNilValue
+// checks, not just the bare nil literal. That is a caller mistake, not a
+// runtime condition: without an allowlist there is nothing to check
+// against, so every request would either be refused outright or crash the
+// handler on its first invocation — a failure that must surface when the
+// server is built, not silently in production on the first request that
+// arrives. A bare `cfg.Allow == nil` used to be the whole check here; it
+// missed a typed nil — a caller's own List implementation, declared but
+// never assigned — which reached this point unrejected and then panicked
+// anyway, just later and less clearly, inside the first real request's
+// call to cfg.Allow.Contains. See nilguard.IsNilValue and origin.Combine,
+// which panics on the identical mistake for the same reason.
 func Gate(cfg GateConfig) func(http.Handler) http.Handler {
-	if cfg.Allow == nil {
+	if nilguard.IsNilValue(cfg.Allow) {
 		panic("gangway: GateConfig.Allow is required")
 	}
 	return func(next http.Handler) http.Handler {
