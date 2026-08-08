@@ -73,11 +73,13 @@ jobs:
         env:
           DOCKHAND_WEBHOOK_SECRET: ${{ secrets.DOCKHAND_GANGWAY_DOCS_WEBHOOK_SECRET }}
         run: |
-          code=$(curl -sS -o /tmp/dockhand-webhook-response.json -w '%{http_code}' \
-            "https://dock.strausmann.cloud/api/git/stacks/40/webhook?secret=${DOCKHAND_WEBHOOK_SECRET}")
+          code=$(curl -sS -G --retry 2 --retry-delay 3 --max-time 30 \
+            --data-urlencode "secret=${DOCKHAND_WEBHOOK_SECRET}" \
+            -o /tmp/dockhand-webhook-response.json -w '%{http_code}' \
+            "https://dock.strausmann.cloud/api/git/stacks/40/webhook")
           echo "Dockhand-Antwort: HTTP ${code}"
-          cat /tmp/dockhand-webhook-response.json
           if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
             echo "::error::Dockhand-Redeploy fehlgeschlagen (HTTP ${code})"
+            cat /tmp/dockhand-webhook-response.json
             exit 1
           fi
