@@ -233,3 +233,7 @@ document.
   when calling one they may not use — `AttachMCP` above is not the whole
   story: see [Hiding tools entirely: AttachMCPSelector](configuration.md#hiding-tools-entirely-attachmcpselector)
   in Configuration.
+- If callers do not authenticate via an OIDC bearer token at all — a
+  static token, a second identity provider — see
+  [Replacing the verifier entirely: WithVerifier](configuration.md#replacing-the-verifier-entirely-withverifier)
+  in Configuration.

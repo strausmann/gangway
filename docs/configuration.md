@@ -90,6 +90,118 @@ set through `identity.OIDCConfig.KeyRefreshInterval`, a field on the
 and `serve.New`. If you need a shorter window than 15 minutes, that is
 the path; there is no `Option` on `serve.Server` for it today.
 
+### Replacing the verifier entirely: WithVerifier
+
+Everything above this point assumes callers present an OIDC bearer token,
+verified against `GANGWAY_ISSUER_URL`'s discovery document. `WithVerifier`
+replaces that assumption outright, for a caller that is not recognised by
+OIDC at all — a static token, an opaque token looked up in your own
+database, a second identity provider Gangway has no built-in support for.
+Anything that implements `identity.Verifier` works:
+
+```go
+type Verifier interface {
+	Verify(ctx context.Context, rawToken string) (*Identity, error)
+}
+```
+
+```go
+gw, err := serve.New(ctx, cfg, serve.WithVerifier(myVerifier))
+```
+
+Once this option is used, `serve.New` never calls `identity.NewOIDC` and
+never touches `GANGWAY_ISSUER_URL`, `GANGWAY_AUDIENCE`, or
+`GANGWAY_SUBJECT_CLAIM` — none of the three need to be set. Everything
+*downstream* of authentication is unaffected: the identity your verifier
+returns is exactly what `serve.IdentityFrom(ctx)` hands to tool handlers
+and what the `GANGWAY_WRITERS_*` grid (or a replaced `access.Decider`)
+checks — so a hand-rolled verifier still needs to populate
+`Identity.Claims` with whatever your writer-claim check expects to find
+there, the same as an OIDC token's claims would.
+
+Omitting `WithVerifier` keeps the default OIDC verifier exactly as
+before — adding this option changes nothing for a server that never
+calls it. Calling it with `nil` is a different, always-mistaken thing:
+`serve.New` refuses it at construction time with an error naming
+`WithVerifier`, rather than silently treating a nil verifier as "no
+option was given" and falling back to OIDC, or, worse, ending up with a
+server that answers requests while never checking anyone.
+
+!!! example "A static bearer token, for a server with exactly one caller"
+
+    ```go
+    package main
+
+    import (
+    	"context"
+    	"errors"
+    	"log"
+    	"net/netip"
+
+    	"github.com/strausmann/gangway/identity"
+    	"github.com/strausmann/gangway/serve"
+    )
+
+    // staticTokenVerifier accepts exactly one bearer token and reports
+    // back a fixed identity -- useful for a caller Gangway does not need
+    // to distinguish from any other, such as a single backend service
+    // calling on its own behalf.
+    type staticTokenVerifier struct {
+    	token string
+    	id    *identity.Identity
+    }
+
+    func (v staticTokenVerifier) Verify(_ context.Context, rawToken string) (*identity.Identity, error) {
+    	if rawToken != v.token {
+    		return nil, errors.New("gangway: unrecognised token")
+    	}
+    	return v.id, nil
+    }
+
+    func main() {
+    	ctx := context.Background()
+
+    	// Built by hand, not via serve.LoadConfig: LoadConfig requires
+    	// GANGWAY_ISSUER_URL and GANGWAY_AUDIENCE to be set in the
+    	// environment even though WithVerifier below never reads them --
+    	// building *serve.Config directly is what actually drops that
+    	// requirement.
+    	prefix, err := netip.ParsePrefix("203.0.113.0/24")
+    	if err != nil {
+    		log.Fatal(err)
+    	}
+    	cfg := &serve.Config{
+    		Addr:            ":8080",
+    		PublicBaseURL:   "https://mcp.example.com",
+    		AllowedPrefixes: []netip.Prefix{prefix},
+    	}
+
+    	verifier := staticTokenVerifier{
+    		token: "REPLACE_ME_WITH_A_LONG_RANDOM_TOKEN",
+    		id: &identity.Identity{
+    			Subject: "backend-service",
+    			Claims:  map[string]any{"sub": "backend-service"},
+    		},
+    	}
+
+    	gw, err := serve.New(ctx, cfg, serve.WithVerifier(verifier))
+    	if err != nil {
+    		log.Fatal(err)
+    	}
+
+    	// gw.AttachMCP(...) / gw.Run(ctx) as in Getting started.
+    	_ = gw
+    }
+    ```
+
+    Reaching for `serve.LoadConfig` instead of building `*serve.Config` by
+    hand still works, but only if `GANGWAY_ISSUER_URL` and
+    `GANGWAY_AUDIENCE` are set to *some* value in the environment —
+    `LoadConfig` validates both before any `Option` gets a chance to run,
+    so it has no way to know a later `WithVerifier` will make them
+    unnecessary. A placeholder value is harmless there; `WithVerifier`
+    guarantees neither one is ever read.
+
 ## Authorization: who may call a writing tool
 
 Reading tools (`access.KindRead`, assigned via `serve.WithToolKinds`) are
