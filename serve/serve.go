@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
@@ -46,12 +47,67 @@ const methodCallTool = "tools/call"
 // -32010 avoids all of those.
 const CodeForbidden int64 = -32010
 
-// wellKnownProtectedResourcePath is the RFC 9728 discovery path a
-// connector fetches after receiving the WWW-Authenticate challenge (see
-// challenge). Handler and challenge share this one constant so the
+// mcpPath is where the MCP endpoint itself is mounted. It is also the
+// resource identifier's path component (see Handler's Resource field) and
+// the suffix RFC 9728's path-specific discovery URI inserts after
+// wellKnownProtectedResourcePath — three things that must, by
+// construction, agree with each other, so this is the one place any of
+// them is written as a literal.
+const mcpPath = "/mcp"
+
+// wellKnownProtectedResourcePath is the root-level RFC 9728 discovery
+// path a connector fetches after receiving the WWW-Authenticate challenge
+// (see challenge). Handler and challenge share this one constant so the
 // pointer challenge hands out and the route Handler actually serves can
 // never drift apart.
 const wellKnownProtectedResourcePath = "/.well-known/oauth-protected-resource"
+
+// wellKnownProtectedResourcePathSpecific is the path-specific RFC 9728
+// discovery URI for the MCP endpoint (RFC 9728 §3.1; the MCP
+// specification gives the identical construction as an example: an
+// endpoint at "/public/mcp" is discoverable at
+// "/.well-known/oauth-protected-resource/public/mcp"). It exists for
+// connectors that probe for this document before ever making an
+// unauthenticated request — the WWW-Authenticate challenge is not the
+// only discovery path the spec recognises, and a connector that only
+// implements well-known-URI probing would otherwise find nothing here.
+const wellKnownProtectedResourcePathSpecific = wellKnownProtectedResourcePath + mcpPath
+
+// maxWiredInstances bounds how many distinct *mcp.Server instances
+// ensureWired will ever wire and track over a Server's lifetime.
+//
+// ensureWired's bookkeeping holds one entry per distinct instance it has
+// ever seen, for as long as the process runs — nothing ever ages an entry
+// out, because there is no way for a *Server to know that an instance
+// selector once returned will never be returned again. That is the
+// correct behaviour, and cheap, for the usage AttachMCPSelector's own doc
+// comment describes: selector choosing among a fixed, long-lived set of
+// instances — one per role, say — so the set stays small and stops
+// growing once every role has been seen once.
+//
+// It stops being cheap the moment selector builds a fresh *mcp.Server
+// per request or per caller instead of choosing from that fixed set — a
+// plausible misreading of "give each caller their own tool catalog" as
+// "give each caller their own instance". Nothing about that misuse fails
+// on its own: the server keeps answering requests, the bookkeeping grows
+// by one entry per request, and the only symptom is a slow decline that
+// looks like nothing in particular until it is an incident. This bound
+// turns that silent decline into an immediate, visible failure instead —
+// see ensureWired: once the number of distinct instances ever seen
+// reaches it, every further previously-unseen instance is refused
+// outright (mapped to the same "selector returned nothing" response
+// AttachMCPSelector already defines, never to a default) instead of
+// being added.
+//
+// 1024 is deliberately far above any plausible number of genuinely
+// distinct, deliberately-designed tool catalogs — even a generous
+// one-instance-per-role or one-instance-per-tenant design stays orders of
+// magnitude below it in any HomeLab-scale or comparable deployment. A
+// legitimate use of AttachMCPSelector should never come close to this
+// number; a design that does should choose from a fixed set instead of
+// building an instance per caller, exactly as MCPSelector's own doc
+// comment already asks for.
+const maxWiredInstances = 1024
 
 // syncWriter serializes writes to an underlying io.Writer. New wraps
 // whatever WithLogWriter configured (or os.Stdout, by default) in one of
@@ -75,22 +131,39 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 // Server is an assembled, ready-to-run MCP server front end.
 //
 // A Server on its own only ever serves /healthz: without a call to
-// AttachMCP, the assembled handler has nothing to route /mcp requests to.
-// AttachMCP is the only way to wire an *mcp.Server into a Server, and it
-// leaves no way to end up with tool calls that bypass authorization: it
-// takes the bare *mcp.Server — before any HTTP handler has been built
-// from it — installs the tool-authorization middleware itself, and
-// builds the HTTP handler itself with stateless sessions forced on. A
-// caller cannot build that handler another way and hand it in instead;
-// there is no exported constructor for it that skips either step.
+// AttachMCP or AttachMCPSelector, the assembled handler has nothing to
+// route /mcp requests to. Those two are the only ways to wire an
+// *mcp.Server into a Server, and both leave no way to end up with tool
+// calls that bypass authorization: each takes a bare *mcp.Server — before
+// any HTTP handler has been built from it — installs the
+// tool-authorization middleware itself, and builds the HTTP handler
+// itself with stateless sessions forced on. A caller cannot build that
+// handler another way and hand it in instead; there is no exported
+// constructor for it that skips either step, for either attachment.
 type Server struct {
-	cfg       *Config
-	verifier  identity.Verifier
-	decider   access.Decider
-	logs      io.Writer
-	toolKinds map[string]access.ToolKind
-	list      origin.List
-	mcp       http.Handler // built by AttachMCP from the *mcp.Server it receives
+	cfg        *Config
+	verifier   identity.Verifier
+	decider    access.Decider
+	logs       io.Writer
+	toolKinds  map[string]access.ToolKind
+	list       origin.List
+	mcp        http.Handler // built by AttachMCP/AttachMCPSelector from the *mcp.Server(s) they receive
+	wired      sync.Map     // *mcp.Server -> *wireState, tracks which instances already carry the tool-authorization middleware
+	wiredCount atomic.Int64 // number of distinct instances ever admitted through ensureWired; see maxWiredInstances
+}
+
+// wireState is ensureWired's per-instance bookkeeping. once gates both the
+// admission decision (against maxWiredInstances) and, for an admitted
+// instance, installing the tool-authorization middleware — doing both
+// inside the same Once means every caller racing to be the first to see a
+// given *mcp.Server blocks until that single decision is fully made, so
+// none can observe the instance as wired (or as rejected) ahead of the
+// others. accepted is only ever written inside once's function and only
+// ever read after a call to once.Do has returned, which the Once itself
+// synchronizes — see ensureWired.
+type wireState struct {
+	once     sync.Once
+	accepted bool
 }
 
 // Option adjusts the assembly.
@@ -231,13 +304,157 @@ func (s *Server) buildAllowList(ctx context.Context) (origin.List, error) {
 //     log.
 //
 // Both are structural, not documented conventions: there is no exported
-// way to reach a *Server's /mcp handler that skips either one.
+// way to reach a *Server's /mcp handler that skips either one. The same
+// is true of AttachMCPSelector, for the same reasons — see there for the
+// case where more than one *mcp.Server is needed.
 func (s *Server) AttachMCP(mcpServer *mcp.Server) {
-	mcpServer.AddReceivingMiddleware(s.toolMiddleware())
+	if _, ok := s.ensureWired(mcpServer); !ok {
+		// Unreachable in practice: AttachMCP wires exactly one instance,
+		// and maxWiredInstances is chosen to comfortably exceed one. If
+		// this ever fires, admission itself is broken, not just this one
+		// server — better to fail loudly at startup than to silently
+		// build an /mcp endpoint with no authorization middleware on it.
+		panic("gangway: AttachMCP could not wire the given *mcp.Server (see maxWiredInstances)")
+	}
 	s.mcp = mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return mcpServer },
 		&mcp.StreamableHTTPOptions{Stateless: true},
 	)
+}
+
+// MCPSelector picks the MCP server instance that should handle a request,
+// given the caller's verified identity. See AttachMCPSelector.
+//
+// selector must choose among a fixed, long-lived set of instances it
+// already holds — one per role, one per tenant, however the catalogs are
+// split — never build a new *mcp.Server inside selector itself. An
+// instance built per request or per caller is never reused, so
+// ensureWired's bookkeeping (which never forgets an instance, by design —
+// see maxWiredInstances) grows by one entry every time selector runs,
+// without bound. That failure mode is silent right up until it isn't: the
+// server keeps answering normally while memory grows, and the bound
+// serve.go enforces exists specifically to turn it into an immediate,
+// visible one instead of a slow decline nobody notices in time.
+type MCPSelector func(ctx context.Context, id *identity.Identity) *mcp.Server
+
+// AttachMCPSelector is AttachMCP's counterpart for a server whose tool
+// catalog depends on who is calling — a role that can only read gets a
+// *mcp.Server with the read-only tools registered on it, a role that can
+// also write gets a different instance with more tools registered, and so
+// on. This is what makes a disallowed tool absent from a caller's tool
+// list instead of merely refused when called: the instance that never had
+// the tool registered can't list it.
+//
+// selector receives the same identity toolMiddleware itself would see
+// (IdentityFrom(ctx) on the request that is about to be routed) and
+// returns the *mcp.Server that should handle it. It is called once per
+// HTTP request, before that request reaches any MCP-level handling.
+//
+// selector returning nil is answered with an HTTP 400 Bad Request — the
+// SDK's own behaviour for a getServer callback that returns nil — never
+// with a default instance. Falling back to something is the wrong
+// behaviour here: a selector that cannot place a caller has, by
+// construction, no basis for guessing what that caller should see, and a
+// silent default would turn "I don't know this caller" into "this caller
+// gets whatever the default happens to expose" — exactly the kind of
+// unreviewable widening AttachMCP's own design exists to rule out.
+//
+// Every distinct *mcp.Server selector can return gets the
+// tool-authorization middleware installed on first use, the same way
+// AttachMCP installs it — there is no way to reach this Server's /mcp
+// route through an instance that never got it, however many instances
+// selector chooses among. Wiring happens under a per-instance sync.Once,
+// so two requests that select the same new instance at the same time
+// both wait for that one-time setup rather than racing past it.
+//
+// Once more than maxWiredInstances distinct instances have been seen —
+// only plausible if selector is not, in fact, choosing from a fixed set
+// (see MCPSelector) — every further previously-unseen instance is refused
+// exactly like a nil return from selector itself: HTTP 400, never a
+// default. This is deliberately the same response as "selector doesn't
+// know this caller": both are "this Server cannot place this request",
+// and neither should look like success to the caller or to anything
+// watching response codes.
+//
+// Stateless sessions are forced exactly as they are for AttachMCP, and
+// for the identical reason (see AttachMCP) — not a second, independent
+// decision that could drift from the first.
+func (s *Server) AttachMCPSelector(selector MCPSelector) {
+	s.mcp = mcp.NewStreamableHTTPHandler(
+		func(r *http.Request) *mcp.Server {
+			id, _ := IdentityFrom(r.Context())
+			chosen := selector(r.Context(), id)
+			if chosen == nil {
+				return nil
+			}
+			wired, ok := s.ensureWired(chosen)
+			if !ok {
+				return nil
+			}
+			return wired
+		},
+		&mcp.StreamableHTTPOptions{Stateless: true},
+	)
+}
+
+// ensureWired installs the tool-authorization middleware on mcpServer the
+// first time it is seen, and never again — AddReceivingMiddleware stacks
+// rather than replaces, so wiring the same instance twice would run
+// authorization twice per call. It also enforces maxWiredInstances: a
+// mcpServer never seen before is admitted only while fewer than that many
+// distinct instances have been admitted already; once the bound is
+// reached, every further previously-unseen instance is refused (ok
+// false), and never gets the middleware installed.
+//
+// The admission decision and the middleware installation both happen
+// inside one wireState.once, found or stored for mcpServer via a single
+// sync.Map.LoadOrStore — the same atomic per-key operation the
+// pre-selector version of this function already relied on. That still
+// matters here for exactly the reason it did before: every caller racing
+// to be the first to see a given, never-before-seen mcpServer receives
+// the identical *wireState and blocks on the identical Do call, so none
+// of them can observe mcpServer as admitted, rejected, or wired ahead of
+// whichever one of them actually decides it — there is no window in
+// which a second request for the same brand-new instance could slip
+// through on a decision the first request has not finished making yet.
+//
+// A rejected instance's entry is deleted again once its (necessarily
+// negative) decision is made: an admission bound that let rejected
+// entries pile up forever would not actually bound anything — the exact
+// misuse this bound exists to catch (a fresh, never-reused *mcp.Server
+// per request) would keep growing the map one rejected entry at a time,
+// just without the middleware-installation cost.
+//
+// wiredCount itself is deliberately never decremented, including for a
+// rejection — not because decrementing would let more than
+// maxWiredInstances instances end up admitted (it would not: the check
+// below runs strictly before any decrement, so a concurrent rejection
+// already past the check cannot free room for one still deciding), but
+// because a monotonic counter is the simpler invariant to hold in mind
+// while reading this function: it only ever answers "how many admission
+// attempts has this Server made", never something that could, at a
+// glance, look like it might legitimately go back down.
+func (s *Server) ensureWired(mcpServer *mcp.Server) (_ *mcp.Server, ok bool) {
+	stateAny, _ := s.wired.LoadOrStore(mcpServer, &wireState{})
+	state := stateAny.(*wireState)
+	state.once.Do(func() {
+		if s.wiredCount.Add(1) > maxWiredInstances {
+			s.wired.Delete(mcpServer)
+			_, _ = fmt.Fprintf(s.logs,
+				"mcp instance limit reached: capacity=%d — AttachMCPSelector's "+
+					"selector must choose from a fixed, long-lived set of "+
+					"*mcp.Server instances (e.g. one per role), not build a new "+
+					"one per request or per caller; see MCPSelector\n",
+				maxWiredInstances)
+			return
+		}
+		mcpServer.AddReceivingMiddleware(s.toolMiddleware())
+		state.accepted = true
+	})
+	if !state.accepted {
+		return nil, false
+	}
+	return mcpServer, true
 }
 
 // toolMiddleware returns the MCP receiving middleware that authorizes
@@ -315,18 +532,40 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// Deliberately not behind authenticate: this is the document a
 	// connector fetches in response to the WWW-Authenticate challenge
-	// (see challenge), before it has a token — gating it would mean the
+	// (see challenge) — or, at the path-specific address, one a connector
+	// may probe for before ever making an unauthenticated request — in
+	// both cases before it has a token. Gating either would mean the
 	// pointer a 401 hands out itself resolves to a 401, a loop with no
 	// way out for a connector that only knows to follow the standard
-	// discovery flow. Still behind the origin gate below: reaching it
-	// requires a connector address, the same as reaching /mcp does.
-	mux.Handle(wellKnownProtectedResourcePath, auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
-		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/"),
+	// discovery flow. Both stay behind the origin gate below: reaching
+	// either requires a connector address, the same as reaching /mcp
+	// does.
+	//
+	// One handler, two registrations: the root address and the
+	// path-specific address for the MCP endpoint (RFC 9728 §3.1; see
+	// wellKnownProtectedResourcePathSpecific) serve the identical
+	// document from the identical instance — nothing here could drift
+	// between the two the way two independent implementations could.
+	metadata := auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+		// The canonical URI for this MCP server is its own endpoint, not
+		// the bare origin: several other things (/healthz, the metadata
+		// documents themselves) also live on this origin, so the origin
+		// alone does not identify the MCP resource. See the MCP
+		// specification's "Canonical Server URI" guidance, which gives
+		// exactly this shape — an origin plus a path component — as the
+		// correct form "when [a] path component is necessary to identify
+		// [an] individual MCP server". A client that validates this field
+		// against the full URL of the request that received the 401 (the
+		// reference SDK's own client does exactly that) would otherwise
+		// reject this document.
+		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/") + mcpPath,
 		AuthorizationServers:   []string{s.cfg.IssuerURL},
 		BearerMethodsSupported: []string{"header"},
-	}))
+	})
+	mux.Handle(wellKnownProtectedResourcePath, metadata)
+	mux.Handle(wellKnownProtectedResourcePathSpecific, metadata)
 	if s.mcp != nil {
-		mux.Handle("/mcp", s.authenticate(s.mcp))
+		mux.Handle(mcpPath, s.authenticate(s.mcp))
 	}
 
 	gate := origin.Gate(origin.GateConfig{

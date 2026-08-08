@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/strausmann/gangway/access"
 	"github.com/strausmann/gangway/accesslog"
 	"github.com/strausmann/gangway/backend"
+	"github.com/strausmann/gangway/identity"
 	"github.com/strausmann/gangway/identity/testidp"
 	"github.com/strausmann/gangway/serve"
 )
@@ -934,6 +937,42 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 // directly, so it fails the same way a real connector would if the route
 // were missing, gated behind authenticate (a loop with no way out), or
 // pointed at the wrong address.
+// fetchMetadataDocument GETs url and returns the raw response body,
+// failing the test on any non-200 or transport error. Shared by the
+// discovery tests below so that comparing two documents byte for byte is
+// comparing what was actually fetched, not two independently-parsed and
+// re-serialised structs that could mask a real difference.
+func fetchMetadataDocument(t *testing.T, url string) []byte {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", url, resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body from %s: %v", url, err)
+	}
+	return body
+}
+
+// TestChallengePointsToAFetchableMetadataDocument reproduces the
+// reference client's own discovery path: follow the resource_metadata URL
+// out of a real 401's WWW-Authenticate header — not a hardcoded path —
+// fetch the document, and check the Resource field against the full URL
+// of the request that triggered the 401, the same check
+// oauthex.GetProtectedResourceMetadata performs. That last check is the
+// one that would have caught the bug this test is now named after: an
+// earlier version of this assertion checked Resource against the bare
+// public base URL instead, which is exactly what the metadata document
+// used to (incorrectly) publish.
+//
+// It also proves the path-specific discovery route (see
+// wellKnownProtectedResourcePathSpecific) serves the identical document —
+// not merely an equivalent one — by comparing both fetches byte for byte.
 func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 	idp := testidp.New(t)
 
@@ -966,7 +1005,8 @@ func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 	ts.Start()
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/mcp")
+	mcpRequestURL := ts.URL + "/mcp"
+	resp, err := http.Get(mcpRequestURL)
 	if err != nil {
 		t.Fatalf("GET /mcp: %v", err)
 	}
@@ -985,24 +1025,23 @@ func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 		t.Fatalf("WWW-Authenticate = %q, resource_metadata value not terminated", challenge)
 	}
 
-	mresp, err := http.Get(metadataURL)
-	if err != nil {
-		t.Fatalf("GET %s (the URL the 401 itself handed out): %v", metadataURL, err)
-	}
-	defer func() { _ = mresp.Body.Close() }()
-	if mresp.StatusCode != http.StatusOK {
-		t.Fatalf("GET %s = %d, want %d", metadataURL, mresp.StatusCode, http.StatusOK)
-	}
+	headerDriven := fetchMetadataDocument(t, metadataURL)
 
 	var doc oauthex.ProtectedResourceMetadata
-	if err := json.NewDecoder(mresp.Body).Decode(&doc); err != nil {
+	if err := json.Unmarshal(headerDriven, &doc); err != nil {
 		t.Fatalf("resource metadata document at %s is not valid JSON: %v", metadataURL, err)
 	}
-	if doc.Resource != publicBaseURL {
-		t.Errorf("Resource = %q, want %q", doc.Resource, publicBaseURL)
+	if doc.Resource != mcpRequestURL {
+		t.Errorf("Resource = %q, want %q (the full URL of the request that triggered the 401)", doc.Resource, mcpRequestURL)
 	}
 	if len(doc.AuthorizationServers) != 1 || doc.AuthorizationServers[0] != idp.URL() {
 		t.Errorf("AuthorizationServers = %v, want [%q]", doc.AuthorizationServers, idp.URL())
+	}
+
+	pathSpecific := fetchMetadataDocument(t, publicBaseURL+"/.well-known/oauth-protected-resource/mcp")
+	if !bytes.Equal(pathSpecific, headerDriven) {
+		t.Errorf("path-specific well-known document differs from the one the WWW-Authenticate header pointed to:\nheader-driven: %s\npath-specific: %s",
+			headerDriven, pathSpecific)
 	}
 }
 
@@ -1087,5 +1126,224 @@ func TestLogWriterNeedNotBeConcurrencySafe(t *testing.T) {
 	const wantLines = n/2*2 + n/2
 	if len(lines) != wantLines {
 		t.Errorf("got %d log lines from %d concurrent requests, want %d", len(lines), n, wantLines)
+	}
+}
+
+// --- AttachMCPSelector: role-scoped tool catalogs ---
+
+// selectorTestServers builds two *mcp.Server instances with different tool
+// catalogs — "restricted" carries only read-tool, "full" carries
+// read-tool and write-tool — for the AttachMCPSelector tests below. A
+// caller only ever sees the tools registered on whichever instance the
+// selector chose for them; there is no filtering step beyond that.
+func selectorTestServers() (restricted, full *mcp.Server) {
+	respond := func(text string) func(context.Context, *mcp.CallToolRequest, noArgs) (*mcp.CallToolResult, any, error) {
+		return func(_ context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, any, error) {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, nil, nil
+		}
+	}
+	restricted = mcp.NewServer(&mcp.Implementation{Name: "restricted", Version: "0.0.0"}, nil)
+	mcp.AddTool(restricted, &mcp.Tool{Name: "read-tool"}, respond("read ok"))
+
+	full = mcp.NewServer(&mcp.Implementation{Name: "full", Version: "0.0.0"}, nil)
+	mcp.AddTool(full, &mcp.Tool{Name: "read-tool"}, respond("read ok"))
+	mcp.AddTool(full, &mcp.Tool{Name: "write-tool"}, respond("write ok"))
+	return restricted, full
+}
+
+// connectSession connects a fresh MCP client session to ts, authenticated
+// with token. Each call is an independent session — this file's other
+// end-to-end tests connect once per gangway.Server; these tests connect
+// once per caller instead, because the whole point under test is that two
+// different callers hitting the same running server see two different
+// results.
+func connectSession(t *testing.T, ts *httptest.Server, token string) *mcp.ClientSession {
+	t.Helper()
+	client := mcp.NewClient(&mcp.Implementation{Name: "gangway-test-client", Version: "0.0.0"}, nil)
+	transport := &mcp.StreamableClientTransport{
+		Endpoint:             ts.URL + "/mcp",
+		HTTPClient:           &http.Client{Transport: bearerRoundTripper{token: token}},
+		DisableStandaloneSSE: true,
+	}
+	session, err := client.Connect(context.Background(), transport, nil)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+func toolNames(t *testing.T, session *mcp.ClientSession) []string {
+	t.Helper()
+	res, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	names := make([]string, len(res.Tools))
+	for i, tool := range res.Tools {
+		names[i] = tool.Name
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestSelectorGivesDifferentCallersDifferentToolLists is the belief this
+// whole attachment exists to satisfy: two callers, distinguished only by
+// a claim in their verified identity, see two different tool lists from
+// the same running server — not the same list with some calls later
+// refused, an actually different list, because the disallowed tool was
+// never registered on the instance that caller was routed to.
+func TestSelectorGivesDifferentCallersDifferentToolLists(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+
+	t.Setenv("GANGWAY_PUBLIC_BASE_URL", "https://mcp.example.com")
+	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
+	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "127.0.0.1/32,::1/128")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	gw, err := serve.New(context.Background(), cfg,
+		serve.WithLogWriter(&logs),
+		serve.WithToolKinds(map[string]access.ToolKind{"read-tool": access.KindRead, "write-tool": access.KindWrite}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	restricted, full := selectorTestServers()
+	gw.AttachMCPSelector(func(_ context.Context, id *identity.Identity) *mcp.Server {
+		if id != nil && id.Claims["role"] == "full" {
+			return full
+		}
+		return restricted
+	})
+
+	ts := httptest.NewServer(gw.Handler())
+	defer ts.Close()
+
+	restrictedToken := idp.Token(map[string]any{
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-restricted",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	fullToken := idp.Token(map[string]any{
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-full", "role": "full",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+
+	gotRestricted := toolNames(t, connectSession(t, ts, restrictedToken))
+	gotFull := toolNames(t, connectSession(t, ts, fullToken))
+
+	if !slices.Equal(gotRestricted, []string{"read-tool"}) {
+		t.Errorf("restricted caller's tool list = %v, want [read-tool]", gotRestricted)
+	}
+	if !slices.Equal(gotFull, []string{"read-tool", "write-tool"}) {
+		t.Errorf("full caller's tool list = %v, want [read-tool write-tool]", gotFull)
+	}
+}
+
+// TestSelectorSelectedInstanceStillEnforcesToolAuthorization proves the
+// selector path cannot be used to skip tool authorization: the caller's
+// instance carries write-tool, but the default grid still refuses it
+// without a writer role — exactly as it would through AttachMCP.
+// Authorization and instance selection are separate, independently
+// enforced concerns; access to an instance's catalog is not access to
+// call everything in it.
+//
+// The selector below is hardcoded to always return full, ignoring the
+// identity entirely — routing is not what this test is about. The token
+// therefore carries no role claim at all: nothing in it should look like
+// a reason write-tool might be allowed, so the refusal is unambiguously
+// the authorization grid's doing, not an accident of what the token
+// happened to contain.
+func TestSelectorSelectedInstanceStillEnforcesToolAuthorization(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+
+	t.Setenv("GANGWAY_PUBLIC_BASE_URL", "https://mcp.example.com")
+	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
+	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "127.0.0.1/32,::1/128")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	gw, err := serve.New(context.Background(), cfg,
+		serve.WithLogWriter(&logs),
+		serve.WithToolKinds(map[string]access.ToolKind{"read-tool": access.KindRead, "write-tool": access.KindWrite}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, full := selectorTestServers()
+	gw.AttachMCPSelector(func(context.Context, *identity.Identity) *mcp.Server { return full })
+
+	ts := httptest.NewServer(gw.Handler())
+	defer ts.Close()
+
+	token := idp.Token(map[string]any{
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-full",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	session := connectSession(t, ts, token)
+
+	if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "write-tool"}); err == nil {
+		t.Fatal("CallTool(write-tool) succeeded, want the tool-authorization middleware to still apply through AttachMCPSelector")
+	}
+}
+
+// TestSelectorReturningNilYieldsBadRequestNotADefaultInstance is the
+// regression test for the "wrong behaviour" the doc comment on
+// AttachMCPSelector calls out by name: a selector that cannot place a
+// caller must not fall back to serving them something anyway.
+func TestSelectorReturningNilYieldsBadRequestNotADefaultInstance(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+
+	t.Setenv("GANGWAY_PUBLIC_BASE_URL", "https://mcp.example.com")
+	t.Setenv("GANGWAY_ISSUER_URL", idp.URL())
+	t.Setenv("GANGWAY_AUDIENCE", "mcp-server")
+	t.Setenv("GANGWAY_ALLOWED_PREFIXES", "127.0.0.1/32,::1/128")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	gw, err := serve.New(context.Background(), cfg, serve.WithLogWriter(&logs))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	gw.AttachMCPSelector(func(context.Context, *identity.Identity) *mcp.Server { return nil })
+
+	ts := httptest.NewServer(gw.Handler())
+	defer ts.Close()
+
+	token := idp.Token(map[string]any{
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-nobody",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d (the SDK's own response for a nil getServer result, not a silently substituted default instance)",
+			resp.StatusCode, http.StatusBadRequest)
 	}
 }
