@@ -96,6 +96,9 @@ In development. Interfaces may still change. See the
 [repository](https://github.com/strausmann/gangway) for the current state of
 the code.
 
+This site is built from the `docs/` directory of that repository on every
+push to `main`, so it always reflects the current state of the code.
+
 ## License
 
 [MIT](https://github.com/strausmann/gangway/blob/main/LICENSE)
