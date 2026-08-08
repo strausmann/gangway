@@ -1246,12 +1246,19 @@ func TestSelectorGivesDifferentCallersDifferentToolLists(t *testing.T) {
 }
 
 // TestSelectorSelectedInstanceStillEnforcesToolAuthorization proves the
-// selector path cannot be used to skip tool authorization: the "full"
-// caller's own instance carries write-tool, but the default grid still
-// refuses it without a writer role — exactly as it would through
-// AttachMCP. Authorization and instance selection are separate,
-// independently-enforced concerns; access to an instance's catalog is not
-// access to call everything in it.
+// selector path cannot be used to skip tool authorization: the caller's
+// instance carries write-tool, but the default grid still refuses it
+// without a writer role — exactly as it would through AttachMCP.
+// Authorization and instance selection are separate, independently
+// enforced concerns; access to an instance's catalog is not access to
+// call everything in it.
+//
+// The selector below is hardcoded to always return full, ignoring the
+// identity entirely — routing is not what this test is about. The token
+// therefore carries no role claim at all: nothing in it should look like
+// a reason write-tool might be allowed, so the refusal is unambiguously
+// the authorization grid's doing, not an accident of what the token
+// happened to contain.
 func TestSelectorSelectedInstanceStillEnforcesToolAuthorization(t *testing.T) {
 	idp := testidp.New(t)
 	var logs syncBuffer
@@ -1280,7 +1287,7 @@ func TestSelectorSelectedInstanceStillEnforcesToolAuthorization(t *testing.T) {
 	defer ts.Close()
 
 	token := idp.Token(map[string]any{
-		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-full", "role": "full",
+		"iss": idp.URL(), "aud": "mcp-server", "sub": "user-full",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 	session := connectSession(t, ts, token)
