@@ -165,6 +165,16 @@ actually covers your caller, then point an MCP-capable client (or
 connector) at `http://localhost:8080/mcp` with a valid token to reach the
 `ping` tool.
 
+That metadata document names `GANGWAY_PUBLIC_BASE_URL` plus `/mcp` as
+this server's resource — not the bare base URL — and is reachable at two
+addresses: the root `/.well-known/oauth-protected-resource` above, which
+is what the `WWW-Authenticate` challenge on a 401 points a connector to,
+and the path-specific
+`/.well-known/oauth-protected-resource/mcp` (RFC 9728 §3.1), for a
+connector that probes for it before ever making an unauthenticated
+request instead of waiting for the challenge. Both serve the identical
+document.
+
 ## Next steps
 
 - Configure a real identity provider: [Microsoft Entra ID](providers/entra.md)
@@ -173,3 +183,7 @@ connector) at `http://localhost:8080/mcp` with a valid token to reach the
   [Behind a proxy](behind-a-proxy.md) before setting
   `GANGWAY_CLIENT_IP_HEADER` — the wrong choice here does not fail loudly,
   it just quietly stops filtering anyone.
+- If different callers should see different tools — not just be refused
+  when calling one they may not use — `AttachMCP` above is not the whole
+  story: see [Hiding tools entirely: AttachMCPSelector](configuration.md#hiding-tools-entirely-attachmcpselector)
+  in Configuration.

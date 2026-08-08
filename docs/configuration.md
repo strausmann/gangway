@@ -128,6 +128,71 @@ caller (every tool reads, say, or the deployment has exactly one trusted
 caller). For anything else, the three `GANGWAY_WRITERS_*` settings above
 are the intended path.
 
+### Hiding tools entirely: AttachMCPSelector
+
+Everything above decides whether a *call* to a tool that exists on the
+server succeeds. It does not change which tools a caller sees when it
+asks for the tool list — every caller gets the same catalog from
+[`AttachMCP`](getting-started.md), and a tool a caller may not call is
+simply refused when they try.
+
+`AttachMCPSelector` is a different attachment for a server whose tool
+*catalog* should depend on who is calling — a caller without the writer
+role never sees `purge-cache` in the list at all, rather than seeing it
+and being refused when they call it:
+
+```go
+type MCPSelector func(ctx context.Context, id *identity.Identity) *mcp.Server
+
+func (s *Server) AttachMCPSelector(selector MCPSelector)
+```
+
+`selector` runs once per HTTP request, before MCP-level handling, and
+receives the same identity the tool-authorization middleware itself
+would see. Build the fixed set of instances once — one per role, one per
+tenant, however the catalogs are split — and have `selector` choose among
+them; never build a `*mcp.Server` inside `selector` itself:
+
+```go
+reader, editor := buildServers() // built once, at startup
+
+gw.AttachMCPSelector(func(_ context.Context, id *identity.Identity) *mcp.Server {
+	if id == nil {
+		return reader
+	}
+	if roles, _ := id.Claims["roles"].([]any); containsEditor(roles) {
+		return editor
+	}
+	return reader
+})
+```
+
+Both `AttachMCP` and `AttachMCPSelector` install the identical
+tool-authorization middleware on every instance they wire, and both
+force stateless sessions — see [`AttachMCP`](getting-started.md) for why.
+Being reachable through a selector's catalog is not the same as being
+allowed to call what is in it: `purge-cache` on the `editor` instance
+above still goes through `access.Decider.Allow` like any other writing
+tool, so the three `GANGWAY_WRITERS_*` settings above still decide who
+may actually call it. The selector only decides who sees it.
+
+If `selector` returns `nil`, the request gets an HTTP 400 — the SDK's own
+behaviour for an empty `getServer` result — never a default instance. A
+selector that cannot place a caller has no basis to guess what that
+caller should see, and a silent default would reopen exactly the kind of
+unreviewable widening the rest of this section exists to prevent.
+
+`selector` is expected to choose from a small, fixed, long-lived set.
+Every previously-unseen instance it returns gets counted, and once more
+than 1024 distinct instances have been seen over the server's lifetime
+— only plausible if `selector` is building a new instance per request or
+per caller instead of choosing from a fixed set — every further
+previously-unseen instance is refused the same way a `nil` return is:
+HTTP 400, plus a diagnostic line naming the limit on the configured log
+writer (`serve.WithLogWriter`, stdout by default). Instances already
+admitted before that point keep working; nothing already wired is torn
+down.
+
 ## Network
 
 | Variable | Purpose | Default |

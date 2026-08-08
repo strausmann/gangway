@@ -56,9 +56,11 @@ for every server.
 ## Known limitations
 
 - **Authorization and access logging cover tool calls only.** The
-  authorization middleware `AttachMCP` installs inspects exactly one MCP
-  method, `tools/call` — it checks `method != "tools/call"` and, for
-  everything else, passes the request straight through unchanged. A
+  authorization middleware that `AttachMCP` installs — and, identically,
+  the middleware `AttachMCPSelector` installs on every instance its
+  selector returns — inspects exactly one MCP method, `tools/call` — it
+  checks `method != "tools/call"` and, for everything else, passes the
+  request straight through unchanged. A
   server that also registers MCP **resources** or **resource templates**
   (`Server.AddResource`, `Server.AddResourceTemplate`) or **prompts**
   (`Server.AddPrompt`) gets no authorization check and no access-log
