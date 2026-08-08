@@ -39,6 +39,11 @@ At least one of the two is required. Both may be set — the effective
 allowlist is their union. Refusing to start with neither configured is
 deliberate: without a filter, every caller would be let in.
 
+If `GANGWAY_REMOTE_LIST_URL` itself carries a credential — a signed URL,
+a token in the query string — a failed fetch will not echo it back:
+every error message this fetch can produce names only the scheme and
+host, never the path or query.
+
 `GANGWAY_REMOTE_LIST_INTERVAL` (optional, default `1h`, minimum `1m`) sets
 the refresh interval for the remote list. The one-minute floor exists
 because this value comes from the environment — unchecked input — and an

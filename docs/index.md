@@ -70,13 +70,6 @@ for every server.
   exposes resources or prompts with content that needs the same
   protection, that protection has to be added separately; Gangway does
   not provide it today.
-- **`PassThrough` and `Exchange` need a token Gangway does not currently
-  hand them.** See [Backend credentials](backend.md) for what this means
-  in practice; in short, the caller's raw bearer token is verified and
-  discarded by the authentication layer, not retained anywhere a tool
-  handler can retrieve it, so these two `backend.TokenSource`
-  implementations are not yet usable end to end through the documented
-  `AttachMCP` flow the way `StaticToken` and `PerUser` are.
 - **Token exchange authenticates by form field only.** `backend.Exchange`
   implements [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)
   token exchange by sending `client_id` and `client_secret` in the POST

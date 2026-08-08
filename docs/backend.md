@@ -72,16 +72,41 @@ backend accepts, via [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)
 token exchange.
 
 Both need the caller's raw incoming token as `TokenFor`'s `incoming`
-parameter — and that is where a real gap sits today: `Server.Handler`'s
-authentication layer verifies the bearer token and places the resulting
-`*identity.Identity` into the request context (retrievable via
-`serve.IdentityFrom`), but it does not also retain the **raw** token
-anywhere a tool handler can reach it. There is currently no exported way
-to recover the original bearer token inside a tool handler built on
-`AttachMCP`'s documented flow. Until that changes, `PassThrough` and
-`Exchange` are usable only if your own code captures the incoming token
-through some other path — they are not yet wired end to end the way
-`StaticToken` and `PerUser` are.
+parameter. Get it with `serve.TokenFrom(ctx)`, the same request-scoped
+context your tool handler already receives:
+
+```go
+mcp.AddTool(mcpServer, &mcp.Tool{Name: "call-the-backend"},
+	func(ctx context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, any, error) {
+		id, _ := serve.IdentityFrom(ctx)
+		incoming, _ := serve.TokenFrom(ctx)
+		source := backend.PassThrough() // or backend.Exchange(...)
+
+		tok, err := source.TokenFor(ctx, id, incoming)
+		if err != nil {
+			return nil, nil, err
+		}
+		return callBackendWith(ctx, tok)
+	})
+```
+
+`Server.Handler`'s authentication layer places the token in the context
+only *after* it has passed verification, in the same success branch as
+the identity — never earlier, never for a token that failed to verify.
+
+!!! danger "What TokenFrom hands back is not your server's own credential"
+
+    The value `TokenFrom` returns is a valid credential belonging to
+    whichever caller made *this specific request* — not a secret your
+    server owns, and not necessarily the only credential that caller
+    holds. Treat it accordingly, in your own tool code exactly as
+    strictly as Gangway treats it internally:
+
+    - Never log it, and never put it anywhere a log write could reach it
+      — an error message, a panic value, a debug dump of the context.
+    - Never forward it anywhere except the one downstream service it was
+      retrieved for (typically straight into `TokenSource.TokenFor`).
+    - Do not cache or persist it beyond the request it was read from.
 
 ## Exchange's client authentication
 
@@ -90,3 +115,8 @@ token-exchange POST body — the authentication method most token-exchange
 endpoints accept. A provider that instead requires HTTP Basic client
 authentication (`Authorization: Basic base64(id:secret)`) is not
 supported by this source; see [Known limitations](index.md#known-limitations).
+
+If `ExchangeConfig.TokenURL` itself carries a credential, a failed
+exchange will not echo it back either — the same host-only error
+messages `GANGWAY_REMOTE_LIST_URL` gets (see [Configuration](configuration.md))
+apply here too.
