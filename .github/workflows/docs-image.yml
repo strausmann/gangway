@@ -61,3 +61,25 @@ jobs:
             CREATED=${{ steps.timestamp.outputs.created }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Nur bei main-Push relevant: der Dockhand-Git-Stack zieht immer den
+      # rollenden :main-Tag, dessen Compose-Datei sich dabei nie aendert --
+      # ohne diesen Anstoss wuerde niemand automatisch merken, dass ein neues
+      # Image bereitsteht (repullImages+forceRedeploy sind serverseitig am
+      # Git-Stack gesetzt, siehe infrastructure/docker/gangway-docs). Das
+      # Secret ist an genau diesen einen Stack gebunden (Wirkungsbereich).
+      - name: Dockhand-Redeploy anstossen
+        if: github.ref == 'refs/heads/main'
+        env:
+          DOCKHAND_WEBHOOK_SECRET: ${{ secrets.DOCKHAND_GANGWAY_DOCS_WEBHOOK_SECRET }}
+        run: |
+          code=$(curl -sS -G --retry 2 --retry-delay 3 --max-time 30 \
+            --data-urlencode "secret=${DOCKHAND_WEBHOOK_SECRET}" \
+            -o /tmp/dockhand-webhook-response.json -w '%{http_code}' \
+            "https://dock.strausmann.cloud/api/git/stacks/40/webhook")
+          echo "Dockhand-Antwort: HTTP ${code}"
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::Dockhand-Redeploy fehlgeschlagen (HTTP ${code})"
+            cat /tmp/dockhand-webhook-response.json
+            exit 1
+          fi
