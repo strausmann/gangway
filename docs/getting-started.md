@@ -100,6 +100,52 @@ building the streamable HTTP handler with `Stateless: true` internally.
     the handler itself and never offers a path that skips it — there is
     no exported way to reach a `Server`'s `/mcp` handler without it.
 
+## Nothing survives past one call
+
+The box above explains why `Stateless: true` is forced. It has a second
+consequence, beyond observability, that a tool handler runs into
+directly: under stateless mode there is no MCP session in the sense the
+protocol usually means it. Per the SDK's own documentation for this
+mode, no session ID a client sends is ever read or validated, and
+**every request gets its own temporary session, created and closed
+within that same request** — including whatever a handler can reach
+through `req.Session` or its ID.
+
+!!! danger "A caller-scoped value that lives on the session is gone on the very next call"
+
+    Any state a tool handler keys to the session — a running list of
+    which IDs it has already handed a caller, so a later "delete" tool
+    can refuse an ID that caller was never shown; a multi-step
+    workflow's progress; anything meant to carry over from one tool
+    call to the next within what looks like a single client connection
+    — is empty again on the next call, because that call runs in a
+    session of its own that did not exist a moment ago and will not
+    exist a moment later.
+
+    Nothing about this fails loudly. No error, no panic: the map is
+    simply always empty, so a check built on "have I seen this ID
+    before" either always passes or always refuses, and whichever it is
+    stays that way silently. This is exactly the failure mode Gangway
+    exists to prevent everywhere else in this project — something that
+    runs and looks like it is protecting a caller while it is not — and
+    it is worth restating why it happens here anyway: `AttachMCP` and
+    `AttachMCPSelector` force stateless mode specifically so the
+    authorization decision the access log records always belongs to
+    the request that actually made it (see the box above). Forcing that
+    is the point, not an oversight; a tool handler that needs state
+    across calls has to get it from somewhere other than the session.
+
+That somewhere is the caller's own verified identity, not the session:
+key whatever needs to persist to `serve.IdentityFrom(ctx)` — typically
+`id.Subject`, or another stable claim — and store it in a durable place
+your server owns (a database, a cache, anything outside the request's
+lifetime), not in a package-level map keyed by session or by anything
+the SDK hands out per connection. That store then needs its own
+retention and expiry policy; under a stateful server a session's own
+lifecycle would eventually clean up state tied to it, but a store keyed
+to an identity that a caller may hold for months does not get that for
+free.
+
 ## Set the environment
 
 Five variables are enough to start:

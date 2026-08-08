@@ -55,6 +55,19 @@ for every server.
 
 ## Known limitations
 
+- **No MCP session outlives a single call — by design, and easy to build
+  around without noticing.** Both `AttachMCP` and `AttachMCPSelector`
+  force stateless HTTP sessions (see [Getting started](getting-started.md#nothing-survives-past-one-call)
+  for why); the SDK's own consequence of that mode is that every request
+  gets a fresh, temporary session, torn down at the end of that same
+  request, and a session ID a client sends is never read. Anything a
+  tool handler keys to the session — a per-caller list built up across
+  calls, a multi-step workflow's progress — is empty again on the very
+  next call, and nothing about that fails loudly: the check just always
+  sees nothing there. Persist across calls by keying to the caller's
+  verified identity (`serve.IdentityFrom(ctx)`) in your own durable
+  store instead — see [Getting started](getting-started.md#nothing-survives-past-one-call)
+  for the full explanation and what that store needs on top.
 - **Authorization and access logging cover tool calls only.** The
   authorization middleware that `AttachMCP` installs — and, identically,
   the middleware `AttachMCPSelector` installs on every instance its
