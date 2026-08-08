@@ -640,6 +640,46 @@ func TestNewRejectsAnExplicitNilVerifier(t *testing.T) {
 	}
 }
 
+// nilPtrVerifier implements identity.Verifier on a pointer receiver that
+// dereferences the receiver. It exists only to construct a *typed* nil:
+// a nil *nilPtrVerifier wrapped in an identity.Verifier interface value
+// is, at the interface level, not equal to the bare nil literal — the
+// interface carries a concrete type (*nilPtrVerifier), only the pointer
+// itself is nil. A plain `s.verifier == nil` check does not catch this;
+// see TestNewRejectsATypedNilVerifier.
+type nilPtrVerifier struct{ token string }
+
+func (v *nilPtrVerifier) Verify(_ context.Context, rawToken string) (*identity.Identity, error) {
+	if rawToken != v.token { // panics here if v is nil: v.token dereferences the receiver
+		return nil, fmt.Errorf("%w: unrecognised token", identity.ErrUnauthenticated)
+	}
+	return &identity.Identity{Subject: "static-user"}, nil
+}
+
+// TestNewRejectsATypedNilVerifier is the regression test for the gap a
+// plain `verifier == nil` check leaves open: a caller who declares a
+// concrete pointer variable but never initialises it —
+// `var v *nilPtrVerifier; serve.WithVerifier(v)` — hands New an
+// identity.Verifier that is *not* the bare nil literal (it carries the
+// concrete type *nilPtrVerifier), so the WithVerifier(nil) check alone
+// would let it through. New must catch this too, not just wait for the
+// first real request to panic on the nil receiver inside Verify.
+func TestNewRejectsATypedNilVerifier(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	var v *nilPtrVerifier // typed nil: v != nil at the interface level once passed to WithVerifier
+	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(v))
+	if err == nil {
+		t.Fatal("want an error for a typed-nil verifier, got none")
+	}
+	if !strings.Contains(err.Error(), "WithVerifier") {
+		t.Errorf("error = %q, want it to mention WithVerifier", err)
+	}
+}
+
 func mustPrefixes(t *testing.T, csv ...string) []netip.Prefix {
 	t.Helper()
 	out := make([]netip.Prefix, 0, len(csv))

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -288,9 +289,14 @@ func New(ctx context.Context, cfg *Config, opts ...Option) (*Server, error) {
 // never overwrite a caller's verifier with an OIDC one built underneath
 // it, which is exactly what unconditionally building the OIDC verifier
 // after applying options used to do.
+//
+// "refused outright" covers more than the bare nil literal: isNilVerifier
+// also catches a *typed* nil, such as a nil pointer that happens to
+// implement identity.Verifier — see isNilVerifier for why `s.verifier ==
+// nil` alone is not enough.
 func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
 	if s.verifierSet {
-		if s.verifier == nil {
+		if isNilVerifier(s.verifier) {
 			return errors.New("gangway: WithVerifier(nil) is not a valid verifier " +
 				"— omit the option entirely to keep the default OIDC verifier")
 		}
@@ -307,6 +313,36 @@ func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
 	}
 	s.verifier = v
 	return nil
+}
+
+// isNilVerifier reports whether v would behave as if unset — panicking
+// or silently doing nothing useful — if resolveVerifier let it through.
+// A plain `v == nil` only catches the bare nil literal: an interface
+// value is nil exactly when *both* its type and its value are unset. It
+// is entirely possible to build a non-nil identity.Verifier whose
+// underlying value is still unusable — a caller who declares a concrete
+// pointer variable and forgets to initialise it, `var v *myVerifier;
+// serve.WithVerifier(v)`, hands New an interface value that carries a
+// concrete type (*myVerifier) and therefore is != nil, even though the
+// pointer itself is nil and calling Verify on it would dereference that
+// nil receiver.
+//
+// The same shape of mistake exists for any of Go's other nilable kinds —
+// a nil map, slice, channel, or func value wrapped in the interface —
+// so this checks all of them via reflection, not just pointers.
+func isNilVerifier(v identity.Verifier) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		// A struct value, an int, anything else that cannot be nil in
+		// the first place: nothing more to check.
+		return false
+	}
 }
 
 // buildAllowList assembles the configured allowlist once, at New time.
