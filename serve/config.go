@@ -26,6 +26,17 @@ type Config struct {
 	Addr          string
 	PublicBaseURL string
 
+	// IssuerURL, Audience and SubjectClaim configure the default OIDC
+	// verifier New builds when serve.WithVerifier is not used (see
+	// resolveVerifier). LoadConfig reads them from the environment but,
+	// deliberately, does not require IssuerURL or Audience to be set:
+	// that requirement already exists one layer down, in
+	// identity.NewOIDC itself, which New's default branch calls and
+	// which has always refused an empty IssuerURL or Audience on its
+	// own. Requiring them here too, in LoadConfig, forced every caller
+	// who uses WithVerifier to also set two values it would then never
+	// read. A caller who omits WithVerifier and leaves either empty
+	// still fails to start — just at New, not at LoadConfig.
 	IssuerURL    string
 	Audience     string
 	SubjectClaim string
@@ -45,9 +56,14 @@ type Config struct {
 // LoadConfig reads the environment.
 //
 // It refuses to return a configuration that would leave the server open:
-// a missing allowlist, issuer, audience, or public base URL is an error,
-// not a default. Better to fail to start with a named cause than to come
-// up wide open because a variable was forgotten.
+// a missing allowlist or public base URL is an error, not a default.
+// Better to fail to start with a named cause than to come up wide open
+// because a variable was forgotten.
+//
+// GANGWAY_ISSUER_URL and GANGWAY_AUDIENCE are read here but deliberately
+// not validated here — see the comment on their fields in Config for why:
+// the requirement to set them belongs to New's default OIDC verifier, not
+// to LoadConfig itself, and used to live in both places at once.
 //
 // Error messages name the offending environment variable but never its
 // value. Several of these variables are not meant to be echoed back —
@@ -66,17 +82,8 @@ func LoadConfig() (*Config, error) {
 		WritersValue:       os.Getenv("GANGWAY_WRITERS_VALUE"),
 	}
 
-	for _, req := range [...]struct {
-		name   string
-		target *string
-	}{
-		{"GANGWAY_PUBLIC_BASE_URL", &cfg.PublicBaseURL},
-		{"GANGWAY_ISSUER_URL", &cfg.IssuerURL},
-		{"GANGWAY_AUDIENCE", &cfg.Audience},
-	} {
-		if *req.target == "" {
-			return nil, fmt.Errorf("gangway: %s is required", req.name)
-		}
+	if cfg.PublicBaseURL == "" {
+		return nil, fmt.Errorf("gangway: GANGWAY_PUBLIC_BASE_URL is required")
 	}
 
 	switch cfg.HeaderMode {

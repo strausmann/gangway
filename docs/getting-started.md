@@ -158,9 +158,16 @@ export GANGWAY_ALLOWED_PREFIXES=203.0.113.0/24
 export GANGWAY_ADDR=:8080
 ```
 
-- `GANGWAY_PUBLIC_BASE_URL`, `GANGWAY_ISSUER_URL`, and `GANGWAY_AUDIENCE` are
-  required — `serve.LoadConfig` refuses to start without them, naming
-  whichever one is missing.
+- `GANGWAY_PUBLIC_BASE_URL` is required — `serve.LoadConfig` refuses to
+  start without it.
+- `GANGWAY_ISSUER_URL` and `GANGWAY_AUDIENCE` are required too, for this
+  default setup (an OIDC verifier built by `serve.New`) — but the check
+  for them lives in `serve.New` itself, not in `LoadConfig`: a server
+  built with [`serve.WithVerifier`](configuration.md#replacing-the-verifier-entirely-withverifier)
+  instead of the default OIDC verifier does not need either. If one is
+  missing here, `go run .` still fails to start, just from `New` rather
+  than `LoadConfig` — the error names the Go field (`IssuerURL`,
+  `Audience`), not the `GANGWAY_*` variable.
 - `GANGWAY_ALLOWED_PREFIXES` is one of two ways to configure the origin
   allowlist (the other is `GANGWAY_REMOTE_LIST_URL`, for a list that
   refreshes itself); at least one is required, or the server refuses to
@@ -181,9 +188,12 @@ go run .
 2026/01/01 00:00:00 gangway: GANGWAY_PUBLIC_BASE_URL is required
 ```
 
-That is what you see if a variable is missing — `LoadConfig` names the
-offending variable and stops. Set all five and the process instead binds to
-`GANGWAY_ADDR` and starts serving `/healthz` and `/mcp`.
+That is what you see if `GANGWAY_PUBLIC_BASE_URL` or the allowlist is
+missing — `LoadConfig` names the offending variable and stops. A missing
+`GANGWAY_ISSUER_URL` or `GANGWAY_AUDIENCE` still stops the process too,
+just one call later, from `serve.New` (see the note above). Set all five
+and the process instead binds to `GANGWAY_ADDR` and starts serving
+`/healthz` and `/mcp`.
 
 ```bash
 curl http://localhost:8080/healthz

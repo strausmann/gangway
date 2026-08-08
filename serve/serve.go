@@ -194,6 +194,21 @@ func WithDecider(d access.Decider) Option { return func(s *Server) { s.decider =
 // identity.NewOIDC and never touches cfg.IssuerURL, cfg.Audience or
 // cfg.SubjectClaim — none of the three need to be set.
 //
+// This is the most security-sensitive extension point in the package:
+// using it redefines what "authenticated" means for this server. Gangway
+// trusts v's Verify implementation completely — it does not, and cannot,
+// second-guess a *Identity that Verify returns. Everything downstream
+// (serve.IdentityFrom, the tool-authorization middleware, the
+// GANGWAY_WRITERS_* grid or a replaced access.Decider) treats that
+// Identity as genuine. A Verify that accepts more than it should — one
+// that is too permissive about which tokens it recognises, or that
+// mishandles the "reject" path so it returns an Identity instead of an
+// error — grants exactly that access, with nothing in Gangway to catch
+// it. Writing a correct Verifier is the caller's responsibility; New only
+// guarantees that some non-nil Verifier is actually in place and gets
+// called (see the nil handling below), never the quality of what it
+// decides.
+//
 // v must not be nil. Omitting this option entirely is how a caller keeps
 // the default OIDC verifier; calling WithVerifier(nil) is a different,
 // and always mistaken, thing — no real Verifier is ever nil — and New

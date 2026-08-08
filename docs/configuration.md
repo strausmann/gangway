@@ -7,8 +7,8 @@ icon: lucide/settings
 `serve.LoadConfig()` reads every one of the settings below from the
 environment — never from a file — so that credentials never end up sitting
 on disk next to the binary. It fails to start rather than come up with a
-gap: a missing issuer, audience, public base URL, or allowlist is an error,
-not a silent default.
+gap: a missing public base URL or allowlist is an error, not a silent
+default.
 
 One setting on this page is the exception to "everything comes from the
 environment": the OIDC key-refresh interval, covered under
@@ -25,8 +25,21 @@ claim values — and startup failures end up in logs.
 | Variable | Purpose | Example |
 |---|---|---|
 | `GANGWAY_PUBLIC_BASE_URL` | The server's own externally reachable base URL. Sent back in the `WWW-Authenticate` challenge so a connector knows where to discover OAuth metadata. Never derived from request headers — that would let a caller redirect the sign-in flow to a server of its own choosing. | `https://mcp.example.com` |
+
+## Required for the default OIDC verifier — not by [`WithVerifier`](#replacing-the-verifier-entirely-withverifier)
+
+| Variable | Purpose | Example |
+|---|---|---|
 | `GANGWAY_ISSUER_URL` | The OpenID Connect issuer, without the `/.well-known/...` suffix. `serve.New` fetches its discovery document at startup and refuses to start if it cannot be reached. | `https://login.microsoftonline.com/<tenant-id>/v2.0` |
 | `GANGWAY_AUDIENCE` | The value the token's `aud` claim must contain. | `api://your-app-id` |
+
+Both are read by `serve.LoadConfig`, but not required by it — the
+requirement lives in `serve.New`'s default branch instead (see
+`identity.NewOIDC`), because that is the only place that actually reads
+them. A caller who calls `serve.New` without `WithVerifier` and leaves
+either empty still fails to start, exactly as before — just from `New`,
+not from `LoadConfig`. A caller who uses `WithVerifier` is not forced to
+set either.
 
 ## The allowlist: one of these two, at least
 
@@ -125,7 +138,26 @@ calls it. Calling it with `nil` is a different, always-mistaken thing:
 `serve.New` refuses it at construction time with an error naming
 `WithVerifier`, rather than silently treating a nil verifier as "no
 option was given" and falling back to OIDC, or, worse, ending up with a
-server that answers requests while never checking anyone.
+server that answers requests while never checking anyone. That refusal
+also catches a *typed* nil — a nil pointer, map, or similar value that
+happens to implement `identity.Verifier` — not just the bare `nil`
+literal, since Go considers those `!= nil` at the interface level even
+though calling `Verify` on one would panic.
+
+!!! danger "Gangway trusts your Verifier completely"
+
+    This is the most security-sensitive extension point in the package —
+    using it redefines what "authenticated" means for this server.
+    Gangway does not, and cannot, second-guess what `Verify` returns:
+    every `*identity.Identity` it hands back is treated as genuine by
+    everything downstream — `serve.IdentityFrom`, the tool-authorization
+    middleware, the `GANGWAY_WRITERS_*` grid. A `Verify` that accepts more
+    than it should, or that mishandles its own rejection path and returns
+    an `Identity` instead of an error, grants exactly that access, with
+    nothing in Gangway to catch it. `New` only guarantees that *some*
+    non-nil `Verifier` is in place and actually gets called — never the
+    correctness of what it decides. Writing a correct `Verifier` is on
+    you.
 
 !!! example "A static bearer token, for a server with exactly one caller"
 
@@ -136,7 +168,6 @@ server that answers requests while never checking anyone.
     	"context"
     	"fmt"
     	"log"
-    	"net/netip"
 
     	"github.com/strausmann/gangway/identity"
     	"github.com/strausmann/gangway/serve"
@@ -171,19 +202,15 @@ server that answers requests while never checking anyone.
     func main() {
     	ctx := context.Background()
 
-    	// Built by hand, not via serve.LoadConfig: LoadConfig requires
-    	// GANGWAY_ISSUER_URL and GANGWAY_AUDIENCE to be set in the
-    	// environment even though WithVerifier below never reads them --
-    	// building *serve.Config directly is what actually drops that
-    	// requirement.
-    	prefix, err := netip.ParsePrefix("203.0.113.0/24")
+    	// GANGWAY_ISSUER_URL and GANGWAY_AUDIENCE do not need to be set:
+    	// LoadConfig no longer requires either (see Required for the
+    	// default OIDC verifier above), and WithVerifier below means New
+    	// never reads them anyway. GANGWAY_PUBLIC_BASE_URL and an allowlist
+    	// (GANGWAY_ALLOWED_PREFIXES or GANGWAY_REMOTE_LIST_URL) are still
+    	// required.
+    	cfg, err := serve.LoadConfig()
     	if err != nil {
     		log.Fatal(err)
-    	}
-    	cfg := &serve.Config{
-    		Addr:            ":8080",
-    		PublicBaseURL:   "https://mcp.example.com",
-    		AllowedPrefixes: []netip.Prefix{prefix},
     	}
 
     	verifier := staticTokenVerifier{
@@ -203,14 +230,6 @@ server that answers requests while never checking anyone.
     	_ = gw
     }
     ```
-
-    Reaching for `serve.LoadConfig` instead of building `*serve.Config` by
-    hand still works, but only if `GANGWAY_ISSUER_URL` and
-    `GANGWAY_AUDIENCE` are set to *some* value in the environment —
-    `LoadConfig` validates both before any `Option` gets a chance to run,
-    so it has no way to know a later `WithVerifier` will make them
-    unnecessary. A placeholder value is harmless there; `WithVerifier`
-    guarantees neither one is ever read.
 
 ## Authorization: who may call a writing tool
 

@@ -464,6 +464,27 @@ func TestNewFailsWhenNoAllowlistIsConfigured(t *testing.T) {
 	}
 }
 
+// TestNewFailsWithoutIssuerOrAudienceWhenWithVerifierIsNotUsed is the
+// complementary proof for TestLoadConfigNoLongerRequiresIssuerOrAudience
+// (serve/config_test.go): LoadConfig no longer refuses a missing
+// GANGWAY_ISSUER_URL/GANGWAY_AUDIENCE, but that requirement did not
+// disappear — it moved one layer later, into New's default branch (see
+// resolveVerifier), which still calls identity.NewOIDC and still refuses
+// an empty IssuerURL or Audience there. A caller who does not use
+// WithVerifier and leaves either empty still cannot start a server.
+func TestNewFailsWithoutIssuerOrAudienceWhenWithVerifierIsNotUsed(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+		// IssuerURL, Audience deliberately empty; no WithVerifier used.
+	}
+
+	_, err := serve.New(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("want an error when IssuerURL/Audience are missing and WithVerifier is not used, got none")
+	}
+}
+
 func TestNewFailsWhenRemoteAllowlistCannotBeFetched(t *testing.T) {
 	idp := testidp.New(t)
 	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -634,6 +655,40 @@ func TestNewRejectsAnExplicitNilVerifier(t *testing.T) {
 	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(nil))
 	if err == nil {
 		t.Fatal("want an error for WithVerifier(nil), got none")
+	}
+	if !strings.Contains(err.Error(), "WithVerifier") {
+		t.Errorf("error = %q, want it to mention WithVerifier", err)
+	}
+}
+
+// TestNewRejectsAnExplicitNilVerifierWithAFullyValidConfig is
+// TestNewRejectsAnExplicitNilVerifier's production-like counterpart. That
+// test's cfg carries an empty IssuerURL, so an error there proves less
+// than it looks like it does: even a New with the WithVerifier(nil)
+// rejection itself removed would still fail on that cfg, just from
+// identity.NewOIDC's own "IssuerURL is required" check — so a regression
+// that silently re-enabled the fallback to the default OIDC verifier
+// could hide behind an unrelated, coincidental error. This test removes
+// that ambiguity: a real test identity provider, every OIDC field set,
+// exactly what a caller who accidentally writes WithVerifier(nil) instead
+// of omitting the option would actually have running. If New silently
+// built the default OIDC verifier here instead of refusing, this test
+// would see no error at all — cfg is valid enough for identity.NewOIDC to
+// succeed on its own.
+func TestNewRejectsAnExplicitNilVerifierWithAFullyValidConfig(t *testing.T) {
+	idp := testidp.New(t)
+
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		IssuerURL:       idp.URL(),
+		Audience:        "mcp-server",
+		SubjectClaim:    "sub",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(nil))
+	if err == nil {
+		t.Fatal("want an error for WithVerifier(nil) even with a fully valid OIDC config, got none")
 	}
 	if !strings.Contains(err.Error(), "WithVerifier") {
 		t.Errorf("error = %q, want it to mention WithVerifier", err)
