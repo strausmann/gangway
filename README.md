@@ -20,7 +20,7 @@ log.Fatal(gw.Run(ctx))
 ```
 
 Five environment variables and this file are a running server — see
-**[Getting started](https://strausmann.github.io/gangway/getting-started/)**
+**[Getting started](https://gangway.strausmann.cloud/getting-started/)**
 for the full, runnable version.
 
 ## Documentation
@@ -28,7 +28,7 @@ for the full, runnable version.
 Full documentation, including provider setup for Entra ID and Authentik,
 the complete environment variable reference, and the one setting that
 silently breaks the origin allowlist when a reverse proxy is involved, is
-published at **<https://strausmann.github.io/gangway/>**.
+published at **<https://gangway.strausmann.cloud/>**.
 
 Status: in development, interfaces may change.
 
