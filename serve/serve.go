@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +21,7 @@ import (
 	"github.com/strausmann/gangway/access"
 	"github.com/strausmann/gangway/accesslog"
 	"github.com/strausmann/gangway/identity"
+	"github.com/strausmann/gangway/internal/nilguard"
 	"github.com/strausmann/gangway/origin"
 )
 
@@ -181,6 +181,11 @@ type wireState struct {
 type Option func(*Server)
 
 // WithDecider replaces the shipped read/write grid.
+//
+// d must not be nil. New refuses an explicit WithDecider(nil) outright,
+// at construction — see resolveDecider — rather than leaving a decider
+// that would panic on the tool-authorization middleware's very first
+// call to Allow.
 func WithDecider(d access.Decider) Option { return func(s *Server) { s.decider = d } }
 
 // WithVerifier replaces the default OIDC verifier New would otherwise
@@ -236,6 +241,12 @@ func WithVerifier(v identity.Verifier) Option {
 // the origin gate's rejection hook — from concurrently handled requests,
 // and a caller providing, say, a plain bytes.Buffer or an unbuffered file
 // handle should not have to reason about that to get correct output.
+//
+// w must not be nil. New refuses an explicit WithLogWriter(nil) outright,
+// at construction — see resolveLogWriter — rather than leaving a writer
+// that would panic on the first line either accesslog.Middleware or the
+// origin gate's rejection hook tries to write, quite possibly after a
+// response has already gone out.
 func WithLogWriter(w io.Writer) Option { return func(s *Server) { s.logs = w } }
 
 // WithToolKinds tells the tool-authorization middleware installed by
@@ -276,6 +287,22 @@ func New(ctx context.Context, cfg *Config, opts ...Option) (*Server, error) {
 	}
 	for _, o := range opts {
 		o(s)
+	}
+
+	// The decider and log-writer checks run first, before resolveVerifier
+	// and before s.logs gets wrapped below: both are cheap, purely local
+	// checks against whatever the options above just set, unlike
+	// resolveVerifier's OIDC discovery round trip against cfg.IssuerURL.
+	// Running them first means a caller who passes a bad decider or log
+	// writer alongside an incomplete OIDC config sees the error that
+	// actually names their mistake, not a coincidental
+	// "GANGWAY_ISSUER_URL is required" from a wholly unrelated check that
+	// simply happened to run first.
+	if err := s.resolveDecider(); err != nil {
+		return nil, err
+	}
+	if err := s.resolveLogWriter(); err != nil {
+		return nil, err
 	}
 	s.logs = &syncWriter{w: s.logs}
 
@@ -352,59 +379,66 @@ func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
 }
 
 // isNilVerifier reports whether v would behave as if unset — panicking
-// or silently doing nothing useful — if resolveVerifier let it through.
-// A plain `v == nil` only catches the bare nil literal: an interface
-// value is nil exactly when *both* its type and its value are unset. It
-// is entirely possible to build a non-nil identity.Verifier whose
-// underlying value is still unusable — a caller who declares a concrete
-// pointer variable and forgets to initialise it, `var v *myVerifier;
-// serve.WithVerifier(v)`, hands New an interface value that carries a
-// concrete type (*myVerifier) and therefore is != nil, even though the
-// pointer itself is nil and calling Verify on it would dereference that
-// nil receiver.
+// or silently doing nothing useful — if resolveVerifier let it through. A
+// plain `v == nil` only catches the bare nil literal; it misses a
+// non-nil identity.Verifier whose underlying value is still unusable —
+// a caller who declares a concrete pointer variable and forgets to
+// initialise it, `var v *myVerifier; serve.WithVerifier(v)`, hands New an
+// interface value that carries a concrete type (*myVerifier) and
+// therefore is != nil, even though the pointer itself is nil and calling
+// Verify on it would dereference that nil receiver.
 //
-// The same shape of mistake exists for any of Go's other nilable kinds —
-// a nil map, slice, channel, or func value wrapped in the interface — so
-// this checks each of them via reflection, not just pointers.
+// The actual reflection-based check — which nilable kinds it covers, and
+// the proof that the two kinds it deliberately does not check
+// (reflect.Interface, reflect.UnsafePointer) can never occur here — lives
+// in nilguard.IsNilValue, shared with the equivalent checks for
+// WithDecider, WithLogWriter, accesslog.Middleware and origin.Combine.
 // serve/serve_test.go's TestNewRejectsATypedNilVerifierForEveryNilableKind
-// exercises one purpose-built type per kind below, so that removing any
-// single case here — the map case, say — fails a specific test instead
-// of silently passing because every kind happened to be covered through
-// whichever one case an existing test used.
-//
-// Two kinds reflect.Kind defines are deliberately absent from the switch
-// below — not an oversight, and not merely unlikely, but structurally
-// impossible for any value that could ever reach here as an
-// identity.Verifier, so checking them would be dead code that looks like
-// coverage without being reachable:
-//
-//   - reflect.Interface: an interface value cannot itself hold another
-//     interface as its dynamic type. Assigning any value to an
-//     interface-typed variable (v identity.Verifier, then v to the `any`
-//     reflect.ValueOf takes) always stores that value's already-concrete
-//     dynamic type — reflect.ValueOf(v).Kind() can never report
-//     Interface here.
-//   - reflect.UnsafePointer: this Kind is only ever reported for a value
-//     of a defined type whose underlying type is unsafe.Pointer itself
-//     — and Go's method-declaration rules refuse a receiver of that
-//     shape outright (`invalid receiver type T (unsafe.Pointer)`, a
-//     compiler error, verified directly rather than assumed). No type
-//     with that underlying type can ever implement identity.Verifier's
-//     Verify method in the first place, so no value of it can ever be
-//     handed to WithVerifier.
-func isNilVerifier(v identity.Verifier) bool {
-	if v == nil {
-		return true
+// exercises one purpose-built type per nilable kind, so that removing any
+// single case from nilguard.IsNilValue's switch fails a specific subtest
+// here instead of silently passing because every kind happened to be
+// covered through whichever one case an existing test used.
+func isNilVerifier(v identity.Verifier) bool { return nilguard.IsNilValue(v) }
+
+// resolveDecider rejects an explicit WithDecider(nil) the same way
+// resolveVerifier rejects WithVerifier(nil) — see isNilVerifier's doc
+// comment for the shared reasoning behind checking more than the bare nil
+// literal. Unlike the verifier, New always assigns a default decider
+// (access.NewGrid, built from cfg) before any Option runs, so there is no
+// analogue to resolveVerifier's s.verifierSet: by the time this runs,
+// s.decider is nil-in-the-nilguard-sense if and only if a caller's own
+// WithDecider option overwrote that default with one, so a bare check
+// after every Option has run is enough. Left unresolved, a nil decider
+// would panic on the very first call to s.decider.Allow — the tool
+// authorization middleware installed by AttachMCP — rather than being
+// refused here, at construction.
+func (s *Server) resolveDecider() error {
+	if nilguard.IsNilValue(s.decider) {
+		return errors.New("gangway: WithDecider(nil) is not a valid decider " +
+			"— omit the option entirely to keep the default read/write grid")
 	}
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
-		return rv.IsNil()
-	default:
-		// A struct value, an int, anything else that cannot be nil in
-		// the first place: nothing more to check.
-		return false
+	return nil
+}
+
+// resolveLogWriter rejects an explicit WithLogWriter(nil) for the same
+// reason resolveDecider rejects WithDecider(nil): New always assigns a
+// default writer (os.Stdout) before any Option runs, so a nil-in-the-
+// nilguard-sense s.logs at this point can only mean a caller's own
+// WithLogWriter option overwrote that default with one.
+//
+// This must run before New wraps s.logs in a *syncWriter — that wrapper
+// is itself always non-nil, so checking after wrapping would hide
+// exactly the mistake this guard exists to catch, leaving it to surface
+// only inside syncWriter.Write, on the first line either
+// accesslog.Middleware or the origin gate's rejection hook tries to
+// write: after a response may already have gone out (see
+// accesslog.Middleware's own doc comment for why that ordering matters).
+func (s *Server) resolveLogWriter() error {
+	if nilguard.IsNilValue(s.logs) {
+		return errors.New("gangway: WithLogWriter(nil) is not a valid log writer " +
+			"— omit the option entirely to keep the default (os.Stdout)")
 	}
+	return nil
 }
 
 // buildAllowList assembles the configured allowlist once, at New time.

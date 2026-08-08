@@ -2,6 +2,7 @@ package accesslog_test
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -381,5 +382,128 @@ func TestEscapeFieldEscapesNewline(t *testing.T) {
 func TestEscapeFieldPassesThroughOrdinaryText(t *testing.T) {
 	if got := accesslog.EscapeField("/mcp"); got != "/mcp" {
 		t.Errorf("EscapeField(%q) = %q, want it unchanged", "/mcp", got)
+	}
+}
+
+// --- Middleware rejects a nil writer at construction ---
+
+// nilPtrWriter implements io.Writer on a pointer receiver that
+// dereferences the receiver, purely to construct a *typed* nil: a nil
+// *nilPtrWriter wrapped in an io.Writer interface value is, at the
+// interface level, not equal to the bare nil literal — the interface
+// carries a concrete type (*nilPtrWriter), only the pointer itself is
+// nil. A plain `out == nil` check does not catch this; see
+// TestMiddlewarePanicsOnATypedNilWriterForEveryNilableKind.
+type nilPtrWriter struct{ buf bytes.Buffer }
+
+func (w *nilPtrWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p) // panics here if w is nil: w.buf dereferences the receiver
+}
+
+// mapWriter, sliceWriter, chanWriter and funcWriter round out the set of
+// nilable kinds the shared nilguard check covers. None of these write
+// anything real; each exists purely to produce a nil value of its
+// specific kind, wrapped in io.Writer, for
+// TestMiddlewarePanicsOnATypedNilWriterForEveryNilableKind.
+type mapWriter map[string]int
+
+func (mapWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type sliceWriter []byte
+
+func (sliceWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type chanWriter chan struct{}
+
+func (chanWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type funcWriter func([]byte) (int, error)
+
+func (f funcWriter) Write(p []byte) (int, error) { return f(p) } // panics if f is nil -- calling a nil func value
+
+// mustPanic runs fn and reports the recovered panic value, or fails the
+// test if fn returned normally.
+func mustPanic(t *testing.T, fn func()) (recovered any) {
+	t.Helper()
+	defer func() {
+		recovered = recover()
+		if recovered == nil {
+			t.Fatal("want a panic, got none")
+		}
+	}()
+	fn()
+	return nil
+}
+
+// TestMiddlewarePanicsOnATypedNilWriterForEveryNilableKind is the
+// table-driven regression guard for Middleware's own nil-writer check,
+// structured exactly like serve's
+// TestNewRejectsATypedNilLogWriterForEveryNilableKind: a real, usable
+// writer (this table's own regression guard) alongside a purpose-built
+// nil of every kind the shared nilguard check covers, so that removing
+// any one case fails precisely the matching subtest here.
+func TestMiddlewarePanicsOnATypedNilWriterForEveryNilableKind(t *testing.T) {
+	cases := []struct {
+		name      string
+		writer    io.Writer
+		wantPanic bool
+	}{
+		{"valid writer", &bytes.Buffer{}, false},
+		{"bare nil literal", nil, true},
+		{"pointer", (*nilPtrWriter)(nil), true},
+		{"map", mapWriter(nil), true},
+		{"slice", sliceWriter(nil), true},
+		{"chan", chanWriter(nil), true},
+		{"func", funcWriter(nil), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantPanic {
+				r := mustPanic(t, func() { accesslog.Middleware(tc.writer) })
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "Middleware") {
+					t.Errorf("recovered panic = %#v, want a string mentioning Middleware", r)
+				}
+				return
+			}
+			// Must not panic, and the result must still be a working
+			// middleware.
+			h := accesslog.Middleware(tc.writer)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = "10.0.0.1:1234"
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		})
+	}
+}
+
+// TestMiddlewarePanicsBeforeAnyResponseIsEverWritten proves the nil-writer
+// check runs at construction — inside Middleware(out) itself — not inside
+// the request handler it would otherwise return. That placement matters
+// because Middleware's normal flow calls next.ServeHTTP (writing the
+// response) before it ever writes the log line: a check placed after that
+// call, inside the per-request handler, would let a caller's response go
+// out to the wire and only then panic while logging it — the caller sees
+// a seemingly healthy response, and the service silently stops logging
+// for its entire remaining lifetime (out is fixed for good at
+// construction). Checking eagerly here means Middleware(nil) never even
+// returns something `next` can be chained onto: `next` cannot be invoked
+// regardless of where in its own body it would have written a response.
+func TestMiddlewarePanicsBeforeAnyResponseIsEverWritten(t *testing.T) {
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("must never be reached"))
+	})
+
+	mustPanic(t, func() {
+		_ = accesslog.Middleware(nil)(next)
+	})
+
+	if called {
+		t.Error("next handler ran despite Middleware being given a nil writer — the response could already be on the wire before the panic")
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/strausmann/gangway/internal/nilguard"
 )
 
 const hexDigits = "0123456789ABCDEF"
@@ -150,7 +152,39 @@ func (r *recorder) Flush() {
 // only understand the combined format keep working unmodified, because
 // the extra fields are appended after the standard ones rather than
 // interleaved.
+//
+// Middleware panics if out is nil — in every sense nilguard.IsNilValue
+// checks, not just the bare nil literal — rather than returning a
+// middleware that would panic later, on the first request's log line.
+// That distinction matters more here than it would for an ordinary
+// nil-argument check: the per-request handler below calls
+// next.ServeHTTP, which writes the response, *before* it writes to out.
+// A nil out caught only there would let the response reach the caller —
+// the service looks healthy from the outside — and then panic while
+// logging it, permanently: out is fixed for the lifetime of the value
+// Middleware returns, so every subsequent request would fail to log the
+// exact same way, silently, for as long as the service keeps running.
+// Checking here, before Middleware returns anything `next` could ever be
+// chained onto, rules that out structurally: next is never invoked, so no
+// response can have gone out, however Middleware's caller wires the
+// result together (this is why the check sits here and not as the first
+// thing inside the returned http.HandlerFunc — that placement would still
+// run once per request instead of once, and — for a next that panics or
+// hijacks the connection before returning — could in principle still let
+// something happen before the check fires).
+//
+// This differs from origin.Gate's cfg.Allow == nil check by using
+// nilguard.IsNilValue instead of a bare comparison: Gate's own doc
+// comment already explains why it panics rather than fails a later
+// request, and the same reasoning applies here, extended to catch a
+// typed nil (a *bytes.Buffer variable that was declared but never
+// assigned, say) the bare comparison alone would miss — see
+// nilguard.IsNilValue's doc comment for the full mechanics.
 func Middleware(out io.Writer) func(http.Handler) http.Handler {
+	if nilguard.IsNilValue(out) {
+		panic("gangway: accesslog.Middleware(nil) is not a valid writer " +
+			"— pass a real io.Writer (os.Stdout, a file, a bytes.Buffer, ...)")
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
@@ -187,6 +221,51 @@ func Middleware(out io.Writer) func(http.Handler) http.Handler {
 			}
 			o.mu.Unlock()
 
+			// The error from this write is deliberately discarded, and
+			// deliberately not escalated into a panic either — this is a
+			// design decision, not an oversight, and the two nil checks
+			// above this function only cover one half of the problem
+			// they were added to close.
+			//
+			// A nil (or typed-nil) out is caught at construction, before
+			// any request is ever served, and failing loudly there is
+			// unambiguously correct — no request has been accepted yet,
+			// there is nothing to lose by refusing to start. A perfectly
+			// valid out that starts failing later — a full disk, a
+			// rotated-and-removed file, a closed pipe on the other end —
+			// is a different problem, discovered only here, per request,
+			// with a response the caller may already be receiving
+			// concurrently on the same connection this line is about
+			// (Handler's response and this write race by design; see the
+			// package doc and recorder above). Two responses to that
+			// failure are both wrong for the same reason Middleware
+			// itself does not silently swallow a nil writer: turning it
+			// into a panic here would fail the request itself over a
+			// pure logging problem, punishing the caller for an
+			// operational issue with the log sink that has nothing to do
+			// with them; but the current out=os.Stdout production default
+			// makes a persistent failure here just as invisible as a nil
+			// writer would have been before construction ever caught it
+			// — the operator loses every log line for as long as out
+			// keeps failing, silently, at precisely the moment (a burst
+			// of denied tool calls, a CrowdSec-relevant spike) they would
+			// most need to see it.
+			//
+			// Recommendation for closing that gap, deliberately not
+			// implemented here: not a panic (couples the request path to
+			// the log sink's health) and not an unconditional per-request
+			// stderr fallback either (as silent as this, in a
+			// containerized deployment where nothing reads stderr, and it
+			// would double the write-failure cost on every single
+			// request during an outage). Instead, a bounded, out-of-band
+			// signal — a counter this package could expose for the
+			// caller's own metrics, or an optional callback in a future
+			// MiddlewareConfig, invoked with the error but never blocking
+			// or influencing the response — so an operator's existing
+			// monitoring can page on "log writes have been failing for N
+			// requests" without every request paying for it and without
+			// this middleware deciding, on the caller's behalf, how loud
+			// that alarm should be.
 			_, _ = fmt.Fprintln(out, line)
 		})
 	}
