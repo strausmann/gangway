@@ -9,6 +9,14 @@ linters:
   enable:
     - revive
 
+# Both caps default to a nonzero value that silently truncates the report
+# once too many issues share the same text or the same linter — a CI run
+# can look clean while findings are hiding behind the cut-off. Set to 0
+# (their documented "disable" value) so every finding is always shown.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 formatters:
   enable:
     - gofmt

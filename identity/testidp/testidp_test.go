@@ -1,0 +1,139 @@
+package testidp_test
+
+import (
+	"encoding/json"
+	"net/http"
+	"testing"
+
+	"github.com/strausmann/gangway/identity/testidp"
+)
+
+func TestServesDiscoveryDocument(t *testing.T) {
+	idp := testidp.New(t)
+
+	resp, err := http.Get(idp.URL() + "/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatalf("get discovery: %v", err)
+	}
+	defer closeBody(t, resp)
+
+	var doc struct {
+		Issuer  string `json:"issuer"`
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Issuer != idp.URL() {
+		t.Errorf("issuer = %q, want %q", doc.Issuer, idp.URL())
+	}
+	if doc.JWKSURI == "" {
+		t.Error("jwks_uri is empty")
+	}
+}
+
+func TestRotateChangesKeyID(t *testing.T) {
+	idp := testidp.New(t)
+
+	before := fetchKeyID(t, idp.URL())
+	idp.Rotate()
+	after := fetchKeyID(t, idp.URL())
+
+	if before == after {
+		t.Errorf("key id unchanged after rotate: %q", before)
+	}
+}
+
+func TestSetUnavailableFailsRequestsUntilCleared(t *testing.T) {
+	idp := testidp.New(t)
+
+	idp.SetUnavailable(true)
+
+	resp, err := http.Get(idp.URL() + "/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatalf("get discovery: %v", err)
+	}
+	closeBody(t, resp)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("discovery status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	resp, err = http.Get(idp.URL() + "/keys")
+	if err != nil {
+		t.Fatalf("get keys: %v", err)
+	}
+	closeBody(t, resp)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("keys status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	idp.SetUnavailable(false)
+
+	resp, err = http.Get(idp.URL() + "/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatalf("get discovery after recovery: %v", err)
+	}
+	closeBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("discovery status after recovery = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestDiscoveryRequestsCountsRejectedRequestsToo(t *testing.T) {
+	idp := testidp.New(t)
+
+	if got := idp.DiscoveryRequests(); got != 0 {
+		t.Fatalf("DiscoveryRequests() before any request = %d, want 0", got)
+	}
+
+	get := func(t *testing.T) {
+		t.Helper()
+		resp, err := http.Get(idp.URL() + "/.well-known/openid-configuration")
+		if err != nil {
+			t.Fatalf("get discovery: %v", err)
+		}
+		closeBody(t, resp)
+	}
+
+	get(t)
+	if got := idp.DiscoveryRequests(); got != 1 {
+		t.Errorf("DiscoveryRequests() after one request = %d, want 1", got)
+	}
+
+	idp.SetUnavailable(true)
+	get(t)
+	if got := idp.DiscoveryRequests(); got != 2 {
+		t.Errorf("DiscoveryRequests() after a rejected request = %d, want 2 (rejected requests must still count)", got)
+	}
+}
+
+func fetchKeyID(t *testing.T, base string) string {
+	t.Helper()
+	resp, err := http.Get(base + "/keys")
+	if err != nil {
+		t.Fatalf("get keys: %v", err)
+	}
+	defer closeBody(t, resp)
+
+	var set struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&set); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(set.Keys) != 1 {
+		t.Fatalf("got %d keys, want 1", len(set.Keys))
+	}
+	return set.Keys[0].Kid
+}
+
+// closeBody closes an HTTP response body and fails the test if closing it
+// returns an error, instead of discarding it.
+func closeBody(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("close response body: %v", err)
+	}
+}
