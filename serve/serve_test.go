@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -936,6 +937,42 @@ func TestOptionsOverrideDefaults(t *testing.T) {
 // directly, so it fails the same way a real connector would if the route
 // were missing, gated behind authenticate (a loop with no way out), or
 // pointed at the wrong address.
+// fetchMetadataDocument GETs url and returns the raw response body,
+// failing the test on any non-200 or transport error. Shared by the
+// discovery tests below so that comparing two documents byte for byte is
+// comparing what was actually fetched, not two independently-parsed and
+// re-serialised structs that could mask a real difference.
+func fetchMetadataDocument(t *testing.T, url string) []byte {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", url, resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body from %s: %v", url, err)
+	}
+	return body
+}
+
+// TestChallengePointsToAFetchableMetadataDocument reproduces the
+// reference client's own discovery path: follow the resource_metadata URL
+// out of a real 401's WWW-Authenticate header — not a hardcoded path —
+// fetch the document, and check the Resource field against the full URL
+// of the request that triggered the 401, the same check
+// oauthex.GetProtectedResourceMetadata performs. That last check is the
+// one that would have caught the bug this test is now named after: an
+// earlier version of this assertion checked Resource against the bare
+// public base URL instead, which is exactly what the metadata document
+// used to (incorrectly) publish.
+//
+// It also proves the path-specific discovery route (see
+// wellKnownProtectedResourcePathSpecific) serves the identical document —
+// not merely an equivalent one — by comparing both fetches byte for byte.
 func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 	idp := testidp.New(t)
 
@@ -968,7 +1005,8 @@ func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 	ts.Start()
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/mcp")
+	mcpRequestURL := ts.URL + "/mcp"
+	resp, err := http.Get(mcpRequestURL)
 	if err != nil {
 		t.Fatalf("GET /mcp: %v", err)
 	}
@@ -987,24 +1025,23 @@ func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 		t.Fatalf("WWW-Authenticate = %q, resource_metadata value not terminated", challenge)
 	}
 
-	mresp, err := http.Get(metadataURL)
-	if err != nil {
-		t.Fatalf("GET %s (the URL the 401 itself handed out): %v", metadataURL, err)
-	}
-	defer func() { _ = mresp.Body.Close() }()
-	if mresp.StatusCode != http.StatusOK {
-		t.Fatalf("GET %s = %d, want %d", metadataURL, mresp.StatusCode, http.StatusOK)
-	}
+	headerDriven := fetchMetadataDocument(t, metadataURL)
 
 	var doc oauthex.ProtectedResourceMetadata
-	if err := json.NewDecoder(mresp.Body).Decode(&doc); err != nil {
+	if err := json.Unmarshal(headerDriven, &doc); err != nil {
 		t.Fatalf("resource metadata document at %s is not valid JSON: %v", metadataURL, err)
 	}
-	if doc.Resource != publicBaseURL {
-		t.Errorf("Resource = %q, want %q", doc.Resource, publicBaseURL)
+	if doc.Resource != mcpRequestURL {
+		t.Errorf("Resource = %q, want %q (the full URL of the request that triggered the 401)", doc.Resource, mcpRequestURL)
 	}
 	if len(doc.AuthorizationServers) != 1 || doc.AuthorizationServers[0] != idp.URL() {
 		t.Errorf("AuthorizationServers = %v, want [%q]", doc.AuthorizationServers, idp.URL())
+	}
+
+	pathSpecific := fetchMetadataDocument(t, publicBaseURL+"/.well-known/oauth-protected-resource/mcp")
+	if !bytes.Equal(pathSpecific, headerDriven) {
+		t.Errorf("path-specific well-known document differs from the one the WWW-Authenticate header pointed to:\nheader-driven: %s\npath-specific: %s",
+			headerDriven, pathSpecific)
 	}
 }
 

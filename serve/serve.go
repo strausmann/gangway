@@ -46,12 +46,31 @@ const methodCallTool = "tools/call"
 // -32010 avoids all of those.
 const CodeForbidden int64 = -32010
 
-// wellKnownProtectedResourcePath is the RFC 9728 discovery path a
-// connector fetches after receiving the WWW-Authenticate challenge (see
-// challenge). Handler and challenge share this one constant so the
+// mcpPath is where the MCP endpoint itself is mounted. It is also the
+// resource identifier's path component (see Handler's Resource field) and
+// the suffix RFC 9728's path-specific discovery URI inserts after
+// wellKnownProtectedResourcePath — three things that must, by
+// construction, agree with each other, so this is the one place any of
+// them is written as a literal.
+const mcpPath = "/mcp"
+
+// wellKnownProtectedResourcePath is the root-level RFC 9728 discovery
+// path a connector fetches after receiving the WWW-Authenticate challenge
+// (see challenge). Handler and challenge share this one constant so the
 // pointer challenge hands out and the route Handler actually serves can
 // never drift apart.
 const wellKnownProtectedResourcePath = "/.well-known/oauth-protected-resource"
+
+// wellKnownProtectedResourcePathSpecific is the path-specific RFC 9728
+// discovery URI for the MCP endpoint (RFC 9728 §3.1; the MCP
+// specification gives the identical construction as an example: an
+// endpoint at "/public/mcp" is discoverable at
+// "/.well-known/oauth-protected-resource/public/mcp"). It exists for
+// connectors that probe for this document before ever making an
+// unauthenticated request — the WWW-Authenticate challenge is not the
+// only discovery path the spec recognises, and a connector that only
+// implements well-known-URI probing would otherwise find nothing here.
+const wellKnownProtectedResourcePathSpecific = wellKnownProtectedResourcePath + mcpPath
 
 // syncWriter serializes writes to an underlying io.Writer. New wraps
 // whatever WithLogWriter configured (or os.Stdout, by default) in one of
@@ -385,18 +404,40 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// Deliberately not behind authenticate: this is the document a
 	// connector fetches in response to the WWW-Authenticate challenge
-	// (see challenge), before it has a token — gating it would mean the
+	// (see challenge) — or, at the path-specific address, one a connector
+	// may probe for before ever making an unauthenticated request — in
+	// both cases before it has a token. Gating either would mean the
 	// pointer a 401 hands out itself resolves to a 401, a loop with no
 	// way out for a connector that only knows to follow the standard
-	// discovery flow. Still behind the origin gate below: reaching it
-	// requires a connector address, the same as reaching /mcp does.
-	mux.Handle(wellKnownProtectedResourcePath, auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
-		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/"),
+	// discovery flow. Both stay behind the origin gate below: reaching
+	// either requires a connector address, the same as reaching /mcp
+	// does.
+	//
+	// One handler, two registrations: the root address and the
+	// path-specific address for the MCP endpoint (RFC 9728 §3.1; see
+	// wellKnownProtectedResourcePathSpecific) serve the identical
+	// document from the identical instance — nothing here could drift
+	// between the two the way two independent implementations could.
+	metadata := auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+		// The canonical URI for this MCP server is its own endpoint, not
+		// the bare origin: several other things (/healthz, the metadata
+		// documents themselves) also live on this origin, so the origin
+		// alone does not identify the MCP resource. See the MCP
+		// specification's "Canonical Server URI" guidance, which gives
+		// exactly this shape — an origin plus a path component — as the
+		// correct form "when [a] path component is necessary to identify
+		// [an] individual MCP server". A client that validates this field
+		// against the full URL of the request that received the 401 (the
+		// reference SDK's own client does exactly that) would otherwise
+		// reject this document.
+		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/") + mcpPath,
 		AuthorizationServers:   []string{s.cfg.IssuerURL},
 		BearerMethodsSupported: []string{"header"},
-	}))
+	})
+	mux.Handle(wellKnownProtectedResourcePath, metadata)
+	mux.Handle(wellKnownProtectedResourcePathSpecific, metadata)
 	if s.mcp != nil {
-		mux.Handle("/mcp", s.authenticate(s.mcp))
+		mux.Handle(mcpPath, s.authenticate(s.mcp))
 	}
 
 	gate := origin.Gate(origin.GateConfig{
