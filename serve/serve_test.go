@@ -770,6 +770,76 @@ func TestNewRejectsATypedNilVerifier(t *testing.T) {
 	}
 }
 
+// nilSliceVerifier, nilChanVerifier and nilFuncVerifier round out the set
+// of nilable kinds isNilVerifier's reflection-based check covers, beyond
+// the pointer case TestNewRejectsATypedNilVerifier already exercises and
+// the map case stubVerifier already provides (its zero value, a nil map,
+// serves that role in the table below — no separate type needed). None
+// of these three types verify anything real; each exists purely to
+// produce a nil value of its specific kind, wrapped in identity.Verifier,
+// for TestNewRejectsATypedNilVerifierForEveryNilableKind.
+type nilSliceVerifier []string
+
+func (nilSliceVerifier) Verify(context.Context, string) (*identity.Identity, error) {
+	return nil, fmt.Errorf("%w: nilSliceVerifier never actually verifies anything", identity.ErrUnauthenticated)
+}
+
+type nilChanVerifier chan struct{}
+
+func (nilChanVerifier) Verify(context.Context, string) (*identity.Identity, error) {
+	return nil, fmt.Errorf("%w: nilChanVerifier never actually verifies anything", identity.ErrUnauthenticated)
+}
+
+type nilFuncVerifier func(context.Context, string) (*identity.Identity, error)
+
+func (f nilFuncVerifier) Verify(ctx context.Context, rawToken string) (*identity.Identity, error) {
+	return f(ctx, rawToken) // panics if f is nil -- calling a nil func value
+}
+
+// TestNewRejectsATypedNilVerifierForEveryNilableKind is the table-driven
+// regression guard isNilVerifier's own doc comment promises but, before
+// this test existed, nothing actually enforced beyond the pointer case:
+// TestNewRejectsATypedNilVerifier alone proved New rejects one of the
+// five kinds isNilVerifier's switch checks (Pointer, Map, Slice, Chan,
+// Func -- Interface and UnsafePointer are excluded there as provably
+// unreachable, see isNilVerifier), leaving the other four asserted by
+// the doc comment but not actually guarded by any test. Removing, say,
+// the map case from that switch would not fail a single test -- exactly
+// the coverage gap a security check must not have. Each case below pairs
+// a nilable Go kind with a purpose-built type of that kind (see above and
+// stubVerifier), so that removing any one case from isNilVerifier's
+// switch fails precisely the matching subtest here, not a coincidental
+// one.
+func TestNewRejectsATypedNilVerifierForEveryNilableKind(t *testing.T) {
+	cases := []struct {
+		name     string
+		verifier identity.Verifier
+	}{
+		{"pointer", (*nilPtrVerifier)(nil)},
+		{"map", stubVerifier(nil)},
+		{"slice", nilSliceVerifier(nil)},
+		{"chan", nilChanVerifier(nil)},
+		{"func", nilFuncVerifier(nil)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &serve.Config{
+				PublicBaseURL:   "https://mcp.example.com",
+				AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+			}
+
+			_, err := serve.New(context.Background(), cfg, serve.WithVerifier(tc.verifier))
+			if err == nil {
+				t.Fatalf("want an error for a nil %s verifier, got none", tc.name)
+			}
+			if !strings.Contains(err.Error(), "WithVerifier") {
+				t.Errorf("error = %q, want it to mention WithVerifier", err)
+			}
+		})
+	}
+}
+
 func mustPrefixes(t *testing.T, csv ...string) []netip.Prefix {
 	t.Helper()
 	out := make([]netip.Prefix, 0, len(csv))

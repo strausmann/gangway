@@ -364,15 +364,41 @@ func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
 // nil receiver.
 //
 // The same shape of mistake exists for any of Go's other nilable kinds —
-// a nil map, slice, channel, or func value wrapped in the interface —
-// so this checks all of them via reflection, not just pointers.
+// a nil map, slice, channel, or func value wrapped in the interface — so
+// this checks each of them via reflection, not just pointers.
+// serve/serve_test.go's TestNewRejectsATypedNilVerifierForEveryNilableKind
+// exercises one purpose-built type per kind below, so that removing any
+// single case here — the map case, say — fails a specific test instead
+// of silently passing because every kind happened to be covered through
+// whichever one case an existing test used.
+//
+// Two kinds reflect.Kind defines are deliberately absent from the switch
+// below — not an oversight, and not merely unlikely, but structurally
+// impossible for any value that could ever reach here as an
+// identity.Verifier, so checking them would be dead code that looks like
+// coverage without being reachable:
+//
+//   - reflect.Interface: an interface value cannot itself hold another
+//     interface as its dynamic type. Assigning any value to an
+//     interface-typed variable (v identity.Verifier, then v to the `any`
+//     reflect.ValueOf takes) always stores that value's already-concrete
+//     dynamic type — reflect.ValueOf(v).Kind() can never report
+//     Interface here.
+//   - reflect.UnsafePointer: this Kind is only ever reported for a value
+//     of a defined type whose underlying type is unsafe.Pointer itself
+//     — and Go's method-declaration rules refuse a receiver of that
+//     shape outright (`invalid receiver type T (unsafe.Pointer)`, a
+//     compiler error, verified directly rather than assumed). No type
+//     with that underlying type can ever implement identity.Verifier's
+//     Verify method in the first place, so no value of it can ever be
+//     handed to WithVerifier.
 func isNilVerifier(v identity.Verifier) bool {
 	if v == nil {
 		return true
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface, reflect.UnsafePointer:
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 		return rv.IsNil()
 	default:
 		// A struct value, an int, anything else that cannot be nil in
