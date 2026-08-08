@@ -34,21 +34,12 @@ LABEL org.opencontainers.image.source="https://github.com/strausmann/gangway" \
       org.opencontainers.image.description="Statische Zensical-Dokumentation fuer Gangway (Go-Bausteine fuer internetseitige MCP-Server: OIDC, IP-Allowlisting, Tool-Autorisierung)."
 
 COPY --from=builder /docs/site /usr/share/nginx/html
+COPY docs/nginx.conf /etc/nginx/conf.d/default.conf
 
-RUN echo 'server { \
-    listen 80; \
-    server_name _; \
-    root /usr/share/nginx/html; \
-    index index.html; \
-    location / { \
-        try_files $uri $uri/ $uri.html /404.html; \
-    } \
-    location /assets/ { \
-        expires 1y; \
-        add_header Cache-Control "public, immutable"; \
-    } \
-    error_page 404 /404.html; \
-}' > /etc/nginx/conf.d/default.conf
+# curl explizit installieren statt auf ein zufaellig mitgeliefertes Binary im
+# Basis-Image zu vertrauen -- der Healthcheck soll unabhaengig davon
+# funktionieren, was nginx:alpine gerade buendelt.
+RUN apk add --no-cache curl
 
 EXPOSE 80
 
