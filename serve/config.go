@@ -30,13 +30,17 @@ type Config struct {
 	// verifier New builds when serve.WithVerifier is not used (see
 	// resolveVerifier). LoadConfig reads them from the environment but,
 	// deliberately, does not require IssuerURL or Audience to be set:
-	// that requirement already exists one layer down, in
-	// identity.NewOIDC itself, which New's default branch calls and
-	// which has always refused an empty IssuerURL or Audience on its
-	// own. Requiring them here too, in LoadConfig, forced every caller
-	// who uses WithVerifier to also set two values it would then never
+	// requiring them here too, in LoadConfig, forced every caller who
+	// uses WithVerifier to also set two values it would then never
 	// read. A caller who omits WithVerifier and leaves either empty
-	// still fails to start — just at New, not at LoadConfig.
+	// still fails to start — just at New's default branch (see
+	// resolveVerifier), not at LoadConfig — and with the same
+	// GANGWAY_ISSUER_URL/GANGWAY_AUDIENCE-naming an operator would have
+	// seen from LoadConfig before: resolveVerifier checks both itself,
+	// before calling identity.NewOIDC, specifically so that a missing
+	// value is still named by its environment variable, not by the Go
+	// field identity.NewOIDC's own (necessarily env-var-agnostic) check
+	// would otherwise report.
 	IssuerURL    string
 	Audience     string
 	SubjectClaim string

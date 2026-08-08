@@ -464,24 +464,59 @@ func TestNewFailsWhenNoAllowlistIsConfigured(t *testing.T) {
 	}
 }
 
-// TestNewFailsWithoutIssuerOrAudienceWhenWithVerifierIsNotUsed is the
+// TestNewFailsWithoutIssuerWhenWithVerifierIsNotUsed and
+// TestNewFailsWithoutAudienceWhenWithVerifierIsNotUsed are the
 // complementary proof for TestLoadConfigNoLongerRequiresIssuerOrAudience
 // (serve/config_test.go): LoadConfig no longer refuses a missing
 // GANGWAY_ISSUER_URL/GANGWAY_AUDIENCE, but that requirement did not
 // disappear — it moved one layer later, into New's default branch (see
-// resolveVerifier), which still calls identity.NewOIDC and still refuses
-// an empty IssuerURL or Audience there. A caller who does not use
-// WithVerifier and leaves either empty still cannot start a server.
-func TestNewFailsWithoutIssuerOrAudienceWhenWithVerifierIsNotUsed(t *testing.T) {
+// resolveVerifier). A caller who does not use WithVerifier and leaves
+// either empty still cannot start a server.
+//
+// Both also guard the specific regression the move risked: New's default
+// branch could have let identity.NewOIDC's own check be the one that
+// fires, and that check names the Go field ("IssuerURL is required"),
+// not the environment variable an operator actually set — a worse error
+// message than LoadConfig used to give for the exact same misconfiguration.
+// resolveVerifier checks both itself first (see its own comment) so the
+// error an operator sees still names GANGWAY_ISSUER_URL/GANGWAY_AUDIENCE,
+// which is what these tests assert, not just "an error happened".
+func TestNewFailsWithoutIssuerWhenWithVerifierIsNotUsed(t *testing.T) {
 	cfg := &serve.Config{
 		PublicBaseURL:   "https://mcp.example.com",
+		Audience:        "mcp-server",
+		SubjectClaim:    "sub",
 		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
-		// IssuerURL, Audience deliberately empty; no WithVerifier used.
+		// IssuerURL deliberately empty; no WithVerifier used.
 	}
 
 	_, err := serve.New(context.Background(), cfg)
 	if err == nil {
-		t.Fatal("want an error when IssuerURL/Audience are missing and WithVerifier is not used, got none")
+		t.Fatal("want an error when IssuerURL is missing and WithVerifier is not used, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_ISSUER_URL") {
+		t.Errorf("error = %q, want it to name GANGWAY_ISSUER_URL", err)
+	}
+}
+
+func TestNewFailsWithoutAudienceWhenWithVerifierIsNotUsed(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL: "https://mcp.example.com",
+		// IssuerURL need not resolve to anything real: resolveVerifier's
+		// own Audience check runs, and fails, before identity.NewOIDC
+		// would ever try to reach it.
+		IssuerURL:       "https://issuer.example.com",
+		SubjectClaim:    "sub",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+		// Audience deliberately empty; no WithVerifier used.
+	}
+
+	_, err := serve.New(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("want an error when Audience is missing and WithVerifier is not used, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_AUDIENCE") {
+		t.Errorf("error = %q, want it to name GANGWAY_AUDIENCE", err)
 	}
 }
 

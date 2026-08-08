@@ -318,6 +318,27 @@ func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
 		return nil
 	}
 
+	// identity.NewOIDC below refuses an empty IssuerURL or Audience on its
+	// own — that check alone would be enough to keep New from starting
+	// with a half-configured OIDC verifier. But its error names the Go
+	// field ("IssuerURL is required"), because identity is a
+	// lower-level package with no notion of GANGWAY_* environment
+	// variables; used by itself, that is the right error to give. A
+	// caller who reached this code via serve.LoadConfig, though, set
+	// these through GANGWAY_ISSUER_URL and GANGWAY_AUDIENCE and would see
+	// an error that does not name either — LoadConfig used to check both
+	// itself and report exactly that, before the check moved here (see
+	// Config's field comment). Checking here too, before calling
+	// identity.NewOIDC, keeps that operator-facing wording: an operator
+	// missing an environment variable still gets told which one, not a
+	// Go field name they would have to translate back themselves.
+	if cfg.IssuerURL == "" {
+		return errors.New("gangway: GANGWAY_ISSUER_URL is required")
+	}
+	if cfg.Audience == "" {
+		return errors.New("gangway: GANGWAY_AUDIENCE is required")
+	}
+
 	v, err := identity.NewOIDC(ctx, identity.OIDCConfig{
 		IssuerURL:    cfg.IssuerURL,
 		Audience:     cfg.Audience,

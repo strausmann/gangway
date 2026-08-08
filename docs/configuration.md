@@ -34,10 +34,11 @@ claim values — and startup failures end up in logs.
 | `GANGWAY_AUDIENCE` | The value the token's `aud` claim must contain. | `api://your-app-id` |
 
 Both are read by `serve.LoadConfig`, but not required by it — the
-requirement lives in `serve.New`'s default branch instead (see
-`identity.NewOIDC`), because that is the only place that actually reads
-them. A caller who calls `serve.New` without `WithVerifier` and leaves
-either empty still fails to start, exactly as before — just from `New`,
+requirement lives in `serve.New`'s default branch instead, exactly where
+the values actually get used (building the OIDC verifier via
+`identity.NewOIDC`). A caller who calls `serve.New` without
+`WithVerifier` and leaves either empty still fails to start, naming the
+`GANGWAY_*` variable exactly as `LoadConfig` used to — just from `New`,
 not from `LoadConfig`. A caller who uses `WithVerifier` is not forced to
 set either.
 
