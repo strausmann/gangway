@@ -1,5 +1,5 @@
 [project]
-site_url = "https://strausmann.github.io/gangway/"
+site_url = "https://gangway.strausmann.cloud/"
 site_name = "Gangway"
 site_description = "Go building blocks for internet-facing MCP servers: OIDC authentication, IP allowlisting, and per-tool authorization."
 
