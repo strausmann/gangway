@@ -75,14 +75,15 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 // Server is an assembled, ready-to-run MCP server front end.
 //
 // A Server on its own only ever serves /healthz: without a call to
-// AttachMCP, the assembled handler has nothing to route /mcp requests to.
-// AttachMCP is the only way to wire an *mcp.Server into a Server, and it
-// leaves no way to end up with tool calls that bypass authorization: it
-// takes the bare *mcp.Server — before any HTTP handler has been built
-// from it — installs the tool-authorization middleware itself, and
-// builds the HTTP handler itself with stateless sessions forced on. A
-// caller cannot build that handler another way and hand it in instead;
-// there is no exported constructor for it that skips either step.
+// AttachMCP or AttachMCPSelector, the assembled handler has nothing to
+// route /mcp requests to. Those two are the only ways to wire an
+// *mcp.Server into a Server, and both leave no way to end up with tool
+// calls that bypass authorization: each takes a bare *mcp.Server — before
+// any HTTP handler has been built from it — installs the
+// tool-authorization middleware itself, and builds the HTTP handler
+// itself with stateless sessions forced on. A caller cannot build that
+// handler another way and hand it in instead; there is no exported
+// constructor for it that skips either step, for either attachment.
 type Server struct {
 	cfg       *Config
 	verifier  identity.Verifier
@@ -90,7 +91,8 @@ type Server struct {
 	logs      io.Writer
 	toolKinds map[string]access.ToolKind
 	list      origin.List
-	mcp       http.Handler // built by AttachMCP from the *mcp.Server it receives
+	mcp       http.Handler // built by AttachMCP/AttachMCPSelector from the *mcp.Server(s) they receive
+	wired     sync.Map     // *mcp.Server -> *sync.Once, tracks which instances already carry the tool-authorization middleware
 }
 
 // Option adjusts the assembly.
@@ -231,13 +233,81 @@ func (s *Server) buildAllowList(ctx context.Context) (origin.List, error) {
 //     log.
 //
 // Both are structural, not documented conventions: there is no exported
-// way to reach a *Server's /mcp handler that skips either one.
+// way to reach a *Server's /mcp handler that skips either one. The same
+// is true of AttachMCPSelector, for the same reasons — see there for the
+// case where more than one *mcp.Server is needed.
 func (s *Server) AttachMCP(mcpServer *mcp.Server) {
-	mcpServer.AddReceivingMiddleware(s.toolMiddleware())
+	s.ensureWired(mcpServer)
 	s.mcp = mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return mcpServer },
 		&mcp.StreamableHTTPOptions{Stateless: true},
 	)
+}
+
+// MCPSelector picks the MCP server instance that should handle a request,
+// given the caller's verified identity. See AttachMCPSelector.
+type MCPSelector func(ctx context.Context, id *identity.Identity) *mcp.Server
+
+// AttachMCPSelector is AttachMCP's counterpart for a server whose tool
+// catalog depends on who is calling — a role that can only read gets a
+// *mcp.Server with the read-only tools registered on it, a role that can
+// also write gets a different instance with more tools registered, and so
+// on. This is what makes a disallowed tool absent from a caller's tool
+// list instead of merely refused when called: the instance that never had
+// the tool registered can't list it.
+//
+// selector receives the same identity toolMiddleware itself would see
+// (IdentityFrom(ctx) on the request that is about to be routed) and
+// returns the *mcp.Server that should handle it. It is called once per
+// HTTP request, before that request reaches any MCP-level handling.
+//
+// selector returning nil is answered with an HTTP 400 Bad Request — the
+// SDK's own behaviour for a getServer callback that returns nil — never
+// with a default instance. Falling back to something is the wrong
+// behaviour here: a selector that cannot place a caller has, by
+// construction, no basis for guessing what that caller should see, and a
+// silent default would turn "I don't know this caller" into "this caller
+// gets whatever the default happens to expose" — exactly the kind of
+// unreviewable widening AttachMCP's own design exists to rule out.
+//
+// Every distinct *mcp.Server selector can return gets the
+// tool-authorization middleware installed on first use, the same way
+// AttachMCP installs it — there is no way to reach this Server's /mcp
+// route through an instance that never got it, however many instances
+// selector chooses among. Wiring happens under a per-instance sync.Once,
+// so two requests that select the same new instance at the same time
+// both wait for that one-time setup rather than racing past it.
+//
+// Stateless sessions are forced exactly as they are for AttachMCP, and
+// for the identical reason (see AttachMCP) — not a second, independent
+// decision that could drift from the first.
+func (s *Server) AttachMCPSelector(selector MCPSelector) {
+	s.mcp = mcp.NewStreamableHTTPHandler(
+		func(r *http.Request) *mcp.Server {
+			id, _ := IdentityFrom(r.Context())
+			chosen := selector(r.Context(), id)
+			if chosen == nil {
+				return nil
+			}
+			return s.ensureWired(chosen)
+		},
+		&mcp.StreamableHTTPOptions{Stateless: true},
+	)
+}
+
+// ensureWired installs the tool-authorization middleware on mcpServer the
+// first time it is seen, and never again — AddReceivingMiddleware stacks
+// rather than replaces, so wiring the same instance twice would run
+// authorization twice per call. The sync.Once found or stored for
+// mcpServer is shared by every caller racing to wire the same
+// never-before-seen instance: all of them block on the same Do call, so
+// none can observe mcpServer as "selected" before it is actually wired.
+func (s *Server) ensureWired(mcpServer *mcp.Server) *mcp.Server {
+	onceAny, _ := s.wired.LoadOrStore(mcpServer, &sync.Once{})
+	onceAny.(*sync.Once).Do(func() {
+		mcpServer.AddReceivingMiddleware(s.toolMiddleware())
+	})
+	return mcpServer
 }
 
 // toolMiddleware returns the MCP receiving middleware that authorizes
