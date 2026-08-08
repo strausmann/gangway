@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -524,6 +525,118 @@ func TestNewSucceedsWithAWorkingRemoteAllowlist(t *testing.T) {
 	w := request(t, gw.Handler(), "203.0.113.5:5000", "", "")
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d (remote-listed address should reach the auth layer)", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// --- New: WithVerifier replaces the default OIDC verifier ---
+
+// stubVerifier is a minimal identity.Verifier for tests: a fixed lookup
+// table from raw token to the *identity.Identity it should produce,
+// standing in for whatever a real non-OIDC verifier would do (a static
+// token, an opaque token looked up in a database, a second identity
+// provider). A token not in the table is rejected the same way a real
+// Verifier rejects one it does not recognise: wrapping
+// identity.ErrUnauthenticated.
+type stubVerifier map[string]*identity.Identity
+
+func (s stubVerifier) Verify(_ context.Context, rawToken string) (*identity.Identity, error) {
+	id, ok := s[rawToken]
+	if !ok {
+		return nil, fmt.Errorf("%w: token not recognised by stubVerifier", identity.ErrUnauthenticated)
+	}
+	return id, nil
+}
+
+// TestWithVerifierReplacesTheDefaultOIDCVerifier is the end-to-end proof
+// that WithVerifier's verifier — not the default OIDC one New would
+// otherwise build — is what actually authenticates a caller: the
+// identity whoami-tool reports back is the stub's own, static subject,
+// which no OIDC verifier built from this cfg could ever produce, since
+// IssuerURL, Audience and SubjectClaim are all left unset. If New still
+// built the default OIDC verifier underneath WithVerifier, it would fail
+// right here — identity.NewOIDC refuses an empty IssuerURL — before the
+// assertions below ever ran.
+func TestWithVerifierReplacesTheDefaultOIDCVerifier(t *testing.T) {
+	verifier := stubVerifier{
+		"good-token": {Subject: "static-user", Claims: map[string]any{"sub": "static-user"}},
+	}
+
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "127.0.0.1/32", "::1/128"),
+	}
+
+	var logs syncBuffer
+	gw, err := serve.New(context.Background(), cfg,
+		serve.WithVerifier(verifier),
+		serve.WithLogWriter(&logs),
+		serve.WithToolKinds(map[string]access.ToolKind{"whoami-tool": access.KindRead}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	session := connectedClient(t, gw, newMCPServer(), "good-token")
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "whoami-tool"})
+	if err != nil {
+		t.Fatalf("CallTool(whoami-tool): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("result.IsError = true, want a successful call: %+v", res.Content)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if text.Text != "static-user" {
+		t.Errorf("whoami-tool reported %q, want the custom verifier's subject %q", text.Text, "static-user")
+	}
+}
+
+// TestWithVerifierRejectsATokenTheCustomVerifierDoesNotKnow proves the
+// stub verifier's own rejection reaches the same challenge path a failed
+// OIDC verification would: a token it does not recognise still ends in
+// 401, not a silent pass-through.
+func TestWithVerifierRejectsATokenTheCustomVerifierDoesNotKnow(t *testing.T) {
+	verifier := stubVerifier{
+		"good-token": {Subject: "static-user"},
+	}
+
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	var logs syncBuffer
+	gw, err := serve.New(context.Background(), cfg, serve.WithVerifier(verifier), serve.WithLogWriter(&logs))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.AttachMCP(stubMCPServer())
+
+	w := request(t, gw.Handler(), "160.79.104.1:5000", "", "an-unknown-token")
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d for a token the custom verifier rejects", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestNewRejectsAnExplicitNilVerifier is the regression test for the
+// dangerous silent case: WithVerifier(nil) must never be mistaken for
+// "no option was given" and quietly fall back to the default OIDC
+// verifier, and must never leave the server with no verifier at all. New
+// refuses it outright, at construction time.
+func TestNewRejectsAnExplicitNilVerifier(t *testing.T) {
+	cfg := &serve.Config{
+		PublicBaseURL:   "https://mcp.example.com",
+		AllowedPrefixes: mustPrefixes(t, "160.79.104.0/21"),
+	}
+
+	_, err := serve.New(context.Background(), cfg, serve.WithVerifier(nil))
+	if err == nil {
+		t.Fatal("want an error for WithVerifier(nil), got none")
+	}
+	if !strings.Contains(err.Error(), "WithVerifier") {
+		t.Errorf("error = %q, want it to mention WithVerifier", err)
 	}
 }
 

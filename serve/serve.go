@@ -141,8 +141,18 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 // handler another way and hand it in instead; there is no exported
 // constructor for it that skips either step, for either attachment.
 type Server struct {
-	cfg        *Config
-	verifier   identity.Verifier
+	cfg *Config
+
+	verifier identity.Verifier
+	// verifierSet records whether WithVerifier ran, independently of
+	// what it set verifier to — verifier's own zero value (nil) cannot
+	// tell "WithVerifier was never called" apart from "WithVerifier(nil)
+	// was called", and resolveVerifier needs to tell those two apart:
+	// the first keeps the default OIDC verifier, the second is a
+	// caller error New must refuse. See WithVerifier and
+	// resolveVerifier.
+	verifierSet bool
+
 	decider    access.Decider
 	logs       io.Writer
 	toolKinds  map[string]access.ToolKind
@@ -171,6 +181,35 @@ type Option func(*Server)
 
 // WithDecider replaces the shipped read/write grid.
 func WithDecider(d access.Decider) Option { return func(s *Server) { s.decider = d } }
+
+// WithVerifier replaces the default OIDC verifier New would otherwise
+// build from cfg.IssuerURL, cfg.Audience and cfg.SubjectClaim.
+//
+// Use it when callers are not recognised by an OIDC bearer token verified
+// against an issuer's discovery document at all — a static token, an
+// opaque token looked up in a database, a second identity provider
+// Gangway has no built-in support for. Anything that implements
+// identity.Verifier works. Once this option is used, New never calls
+// identity.NewOIDC and never touches cfg.IssuerURL, cfg.Audience or
+// cfg.SubjectClaim — none of the three need to be set.
+//
+// v must not be nil. Omitting this option entirely is how a caller keeps
+// the default OIDC verifier; calling WithVerifier(nil) is a different,
+// and always mistaken, thing — no real Verifier is ever nil — and New
+// tells the two apart (see resolveVerifier) rather than treating a nil v
+// as "no option was given" and silently falling back to OIDC, or worse,
+// silently ending up with no verifier at all. A caller who ends up here
+// by accident — a variable that was supposed to hold a real Verifier but
+// turned out unset, say — gets a loud failure at startup instead of a
+// server that looks like it is checking tokens while every call to
+// Verify would in fact panic on a nil receiver, or, for an
+// interface-typed nil built some other way, could not be called at all.
+func WithVerifier(v identity.Verifier) Option {
+	return func(s *Server) {
+		s.verifier = v
+		s.verifierSet = true
+	}
+}
 
 // WithLogWriter redirects the access log. Defaults to stdout.
 //
@@ -224,21 +263,50 @@ func New(ctx context.Context, cfg *Config, opts ...Option) (*Server, error) {
 	}
 	s.logs = &syncWriter{w: s.logs}
 
-	var err error
-	s.verifier, err = identity.NewOIDC(ctx, identity.OIDCConfig{
-		IssuerURL:    cfg.IssuerURL,
-		Audience:     cfg.Audience,
-		SubjectClaim: cfg.SubjectClaim,
-	})
-	if err != nil {
+	if err := s.resolveVerifier(ctx, cfg); err != nil {
 		return nil, err
 	}
 
+	var err error
 	if s.list, err = s.buildAllowList(ctx); err != nil {
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// resolveVerifier settles s.verifier once every Option has already run.
+//
+// An explicit WithVerifier(nil) is refused outright — see WithVerifier
+// for why silently accepting it would be the exact failure mode this
+// whole package exists to prevent. No call to WithVerifier at all builds
+// the default OIDC verifier exactly as before WithVerifier existed:
+// nothing about adding this option changes behaviour for a caller that
+// never uses it. Any other call to WithVerifier has already placed its
+// verifier in s.verifier by the time this runs (see Option, applied in
+// New before this call) — resolveVerifier leaves it untouched; New must
+// never overwrite a caller's verifier with an OIDC one built underneath
+// it, which is exactly what unconditionally building the OIDC verifier
+// after applying options used to do.
+func (s *Server) resolveVerifier(ctx context.Context, cfg *Config) error {
+	if s.verifierSet {
+		if s.verifier == nil {
+			return errors.New("gangway: WithVerifier(nil) is not a valid verifier " +
+				"— omit the option entirely to keep the default OIDC verifier")
+		}
+		return nil
+	}
+
+	v, err := identity.NewOIDC(ctx, identity.OIDCConfig{
+		IssuerURL:    cfg.IssuerURL,
+		Audience:     cfg.Audience,
+		SubjectClaim: cfg.SubjectClaim,
+	})
+	if err != nil {
+		return err
+	}
+	s.verifier = v
+	return nil
 }
 
 // buildAllowList assembles the configured allowlist once, at New time.
