@@ -1678,6 +1678,154 @@ func TestChallengePointsToAFetchableMetadataDocument(t *testing.T) {
 	}
 }
 
+// --- GANGWAY_REQUIRED_SCOPES: advertised via both RFC 9728 discovery paths ---
+
+// wellKnownProtectedResourcePath mirrors the unexported constant of the
+// same name in serve.go. Duplicated here, as a literal, for the same
+// reason request above hardcodes "/mcp": these tests live in the _test
+// (black-box) package and have no access to serve's unexported names —
+// only to the wire behaviour those names produce.
+const wellKnownProtectedResourcePath = "/.well-known/oauth-protected-resource"
+
+// metadataRequest GETs path (expected to be one of the two RFC 9728
+// discovery routes) from an address inside the fixed allowlist newServer
+// configures, and returns the raw response body — never an
+// already-unmarshalled struct, so a test asserting a field's *absence*
+// (omitempty dropping it) is checking the actual bytes on the wire, not
+// a Go zero value that would look identical whether the field was
+// dropped or merely came back empty.
+func metadataRequest(t *testing.T, h http.Handler, path string) (*http.Response, []byte) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, path, nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	resp := w.Result()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading metadata response body: %v", err)
+	}
+	return resp, body
+}
+
+// TestChallengeAdvertisesRequiredScopeWhenConfigured is the regression
+// test for the bug this task fixes: a connector following only what
+// gangway's own WWW-Authenticate challenge advertises — not the RFC 9728
+// metadata document, not out-of-band configuration — must be able to
+// learn which scope to request. Before this field existed, the challenge
+// carried no scope information at all; a connector that (correctly, per
+// RFC 6750 §3) reads the "scope" parameter from here would have signed
+// in for the wrong audience and only found out at the first tool call.
+func TestChallengeAdvertisesRequiredScopeWhenConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access")
+	h := newServer(t, idp, &logs)
+
+	w := request(t, h, "172.20.0.5:5000", "160.79.104.1", "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+
+	challenge := w.Header().Get("WWW-Authenticate")
+	if !strings.Contains(challenge, `scope="mcp.access"`) {
+		t.Errorf(`WWW-Authenticate = %q, want a scope="mcp.access" parameter`, challenge)
+	}
+	// The scope parameter must not have displaced resource_metadata — a
+	// connector still needs the discovery pointer to find the issuer and
+	// everything else the metadata document carries.
+	if !strings.Contains(challenge, "resource_metadata") {
+		t.Errorf("WWW-Authenticate = %q, still want a resource_metadata reference", challenge)
+	}
+}
+
+// TestChallengeAdvertisesMultipleRequiredScopesSpaceDelimited checks the
+// RFC 6750 §3 wire format directly: "scope" is a single quoted-string
+// holding a space-delimited list, not one parameter per scope (which
+// would not be legal auth-param syntax) and not a comma-delimited list
+// (which is how GANGWAY_REQUIRED_SCOPES itself is written, but not what
+// the wire format uses).
+func TestChallengeAdvertisesMultipleRequiredScopesSpaceDelimited(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access,offline_access")
+	h := newServer(t, idp, &logs)
+
+	w := request(t, h, "172.20.0.5:5000", "160.79.104.1", "")
+
+	challenge := w.Header().Get("WWW-Authenticate")
+	if !strings.Contains(challenge, `scope="mcp.access offline_access"`) {
+		t.Errorf(`WWW-Authenticate = %q, want scope="mcp.access offline_access"`, challenge)
+	}
+}
+
+// TestChallengeOmitsScopeParameterWhenNoRequiredScopesConfigured is the
+// regression test for backward compatibility: RequiredScopes is new, and
+// nothing about the challenge a caller who never sets
+// GANGWAY_REQUIRED_SCOPES receives may change. This checks the header's
+// exact value, not just the absence of one substring, so that any other
+// unintended change to the unconfigured path would also be caught here.
+func TestChallengeOmitsScopeParameterWhenNoRequiredScopesConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	h := newServer(t, idp, &logs) // GANGWAY_REQUIRED_SCOPES deliberately left unset
+
+	w := request(t, h, "172.20.0.5:5000", "160.79.104.1", "")
+
+	challenge := w.Header().Get("WWW-Authenticate")
+	want := `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"`
+	if challenge != want {
+		t.Errorf("WWW-Authenticate = %q, want %q (unchanged from before RequiredScopes existed)", challenge, want)
+	}
+}
+
+// TestMetadataDocumentAdvertisesScopesSupportedWhenConfigured is the RFC
+// 9728 discovery-document half of the same fix: a connector that probes
+// for the well-known document before ever receiving a 401 (see
+// wellKnownProtectedResourcePathSpecific's own doc comment for why that
+// path exists) needs scopes_supported there too — the WWW-Authenticate
+// challenge alone does not reach a connector that never triggers it.
+func TestMetadataDocumentAdvertisesScopesSupportedWhenConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access,offline_access")
+	h := newServer(t, idp, &logs)
+
+	resp, body := metadataRequest(t, h, wellKnownProtectedResourcePath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", wellKnownProtectedResourcePath, resp.StatusCode, http.StatusOK)
+	}
+
+	var doc oauthex.ProtectedResourceMetadata
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("metadata document is not valid JSON: %v", err)
+	}
+	want := []string{"mcp.access", "offline_access"}
+	if !slices.Equal(doc.ScopesSupported, want) {
+		t.Errorf("ScopesSupported = %v, want %v", doc.ScopesSupported, want)
+	}
+}
+
+// TestMetadataDocumentOmitsScopesSupportedFieldWhenNotConfigured is the
+// regression test for backward compatibility on the discovery-document
+// side: it checks the raw JSON bytes for the field name, not just that
+// an unmarshalled ScopesSupported comes back empty — a Go zero value
+// looks identical whether the field was omitted or present-but-empty, so
+// only the wire bytes actually prove omitempty did its job.
+func TestMetadataDocumentOmitsScopesSupportedFieldWhenNotConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	h := newServer(t, idp, &logs) // GANGWAY_REQUIRED_SCOPES deliberately left unset
+
+	resp, body := metadataRequest(t, h, wellKnownProtectedResourcePath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", wellKnownProtectedResourcePath, resp.StatusCode, http.StatusOK)
+	}
+	if bytes.Contains(body, []byte("scopes_supported")) {
+		t.Errorf("metadata document contains scopes_supported unset, want the field omitted entirely: %s", body)
+	}
+}
+
 // --- WithLogWriter: the writer need not be safe for concurrent use ---
 
 // TestLogWriterNeedNotBeConcurrencySafe reproduces the review finding
