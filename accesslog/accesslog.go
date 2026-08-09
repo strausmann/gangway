@@ -95,6 +95,48 @@ type outcome struct {
 
 type ctxKey struct{}
 
+// addrKey is deliberately a distinct type from ctxKey: both are stored via
+// context.WithValue on the same context tree, and a shared key type would
+// make the two values collide.
+type addrKey struct{}
+
+// WithResolvedAddr attaches an already-determined client address to ctx,
+// for Middleware to log in place of the request's own r.RemoteAddr.
+//
+// This exists for exactly one ordering problem: Middleware wraps
+// everything else a caller composes with it, so by the time a deeper
+// layer — an allowlist gate sitting behind a reverse proxy, say —
+// resolves the real caller from a forwarding header, that layer only ever
+// sees its own copy of the request (http.Request.WithContext returns a
+// new value; it does not, and cannot, reach back into the *http.Request
+// Middleware's own handler closure is holding). Whatever that deeper
+// layer stores into its own request's context is therefore invisible to
+// Middleware, no matter how it stores it — this is a different problem
+// from the one MarkToolOutcome solves (a value only known once a deeper
+// layer has run, read back after that layer returns), not the same one
+// under a different name.
+//
+// The only place a value can reach Middleware's own r is a middleware
+// composed strictly outside (ahead of) it — WithResolvedAddr exists so
+// that outer middleware has something to call. Composed there, its
+// result becomes the very http.Request Middleware's returned handler
+// receives as its own argument, no indirection required. See
+// serve.Server's own such middleware (resolveClientAddr) for a concrete
+// caller.
+//
+// A request with nothing set here is unaffected: Middleware falls back to
+// its pre-existing behaviour of parsing r.RemoteAddr directly, exactly as
+// it always has for a caller that composes Middleware on its own, without
+// anything else attached ahead of it.
+func WithResolvedAddr(ctx context.Context, addr string) context.Context {
+	return context.WithValue(ctx, addrKey{}, addr)
+}
+
+func resolvedAddrFrom(ctx context.Context) (string, bool) {
+	addr, ok := ctx.Value(addrKey{}).(string)
+	return addr, ok
+}
+
 // MarkToolOutcome records the result of a tool call for the current
 // request.
 //
@@ -198,9 +240,13 @@ func Middleware(out io.Writer) func(http.Handler) http.Handler {
 				rec.status = http.StatusOK
 			}
 
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				host = r.RemoteAddr
+			host, ok := resolvedAddrFrom(r.Context())
+			if !ok {
+				var err error
+				host, _, err = net.SplitHostPort(r.RemoteAddr)
+				if err != nil {
+					host = r.RemoteAddr
+				}
 			}
 
 			line := fmt.Sprintf(`%s - - [%s] "%s %s %s" %d %d "%s" "%s"`,
