@@ -1,6 +1,7 @@
 package serve_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -294,6 +295,110 @@ func TestLoadConfigRefusesMalformedAllowWriteByDefault(t *testing.T) {
 	}
 }
 
+// --- GANGWAY_REQUIRED_SCOPES ---
+
+func TestLoadConfigDefaultsRequiredScopesToEmpty(t *testing.T) {
+	setMinimalEnv(t)
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(cfg.RequiredScopes) != 0 {
+		t.Errorf("RequiredScopes = %v, want none", cfg.RequiredScopes)
+	}
+}
+
+func TestLoadConfigParsesRequiredScopes(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !slices.Equal(cfg.RequiredScopes, []string{"mcp.access"}) {
+		t.Errorf("RequiredScopes = %v, want [%q]", cfg.RequiredScopes, "mcp.access")
+	}
+}
+
+func TestLoadConfigParsesMultipleRequiredScopesWithWhitespaceAndBlanks(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", " mcp.access , ,offline_access")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !slices.Equal(cfg.RequiredScopes, []string{"mcp.access", "offline_access"}) {
+		t.Errorf("RequiredScopes = %v, want [%q %q]", cfg.RequiredScopes, "mcp.access", "offline_access")
+	}
+}
+
+// TestLoadConfigRefusesRequiredScopeContainingASpace is the regression
+// test for the reason RequiredScopes is validated at all: RFC 6749 §3.3
+// defines a scope-token as excluding space, and Server.challenge below
+// joins RequiredScopes with a single space to build the WWW-Authenticate
+// "scope" parameter. An entry that itself contained a space would
+// silently turn one configured scope into two once a connector splits
+// that parameter back apart — the same failure mode the missing scope
+// advertisement this task fixes was caused by, just self-inflicted
+// instead of upstream. Rejecting it at startup, named, is cheaper than
+// debugging a connector that parses the challenge "correctly" and still
+// requests the wrong scope.
+func TestLoadConfigRefusesRequiredScopeContainingASpace(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp access")
+
+	_, err := serve.LoadConfig()
+	if err == nil {
+		t.Fatal("want an error for a scope containing a space, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_REQUIRED_SCOPES") {
+		t.Errorf("error %q does not name the offending variable", err)
+	}
+}
+
+// TestLoadConfigRefusesRequiredScopeContainingADoubleQuote is the
+// regression test for the other half of the same reason: the challenge
+// wraps RequiredScopes in a quoted-string (`scope="..."`). A scope value
+// containing an unescaped double quote would terminate that quoted-string
+// early and corrupt the WWW-Authenticate header for every caller, not
+// just the one connector that happened to request it — RFC 6749 §3.3
+// excludes the double quote from scope-token for exactly this reason.
+func TestLoadConfigRefusesRequiredScopeContainingADoubleQuote(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", `mcp."access`)
+
+	_, err := serve.LoadConfig()
+	if err == nil {
+		t.Fatal("want an error for a scope containing a double quote, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_REQUIRED_SCOPES") {
+		t.Errorf("error %q does not name the offending variable", err)
+	}
+}
+
+// TestLoadConfigAcceptsARequiredScopeWithURNStyleColonsAndSlashes documents
+// the other end of the same boundary: scope-token's allowed range
+// (%x21 / %x23-5B / %x5D-7E) is far wider than the alphanumeric-dot names
+// used elsewhere in this file's tests — colons, slashes and dots are all
+// inside it, which is what lets URN- or URL-shaped scopes (as several
+// real providers issue, e.g. "urn:mcp:access") through unmodified.
+func TestLoadConfigAcceptsARequiredScopeWithURNStyleColonsAndSlashes(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "urn:mcp:access,https://example.com/mcp.read")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"urn:mcp:access", "https://example.com/mcp.read"}
+	if !slices.Equal(cfg.RequiredScopes, want) {
+		t.Errorf("RequiredScopes = %v, want %v", cfg.RequiredScopes, want)
+	}
+}
+
 func TestLoadConfigCarriesWritersClaimAndValue(t *testing.T) {
 	setMinimalEnv(t)
 	t.Setenv("GANGWAY_WRITERS_CLAIM", "groups")
@@ -353,6 +458,12 @@ func TestLoadConfigErrorsNeverContainTheOffendingValue(t *testing.T) {
 			env:    "GANGWAY_ALLOW_WRITE_BY_DEFAULT",
 			value:  "not-a-bool-9c8d7e6f",
 			secret: "9c8d7e6f",
+		},
+		{
+			name:   "invalid required scope",
+			env:    "GANGWAY_REQUIRED_SCOPES",
+			value:  "not a valid scope-7b6a5c4d",
+			secret: "7b6a5c4d",
 		},
 	}
 

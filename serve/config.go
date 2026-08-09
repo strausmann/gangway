@@ -55,6 +55,25 @@ type Config struct {
 	WritersClaim        string
 	WritersValue        string
 	AllowWriteByDefault bool
+
+	// RequiredScopes lists the OAuth 2.0 scope values (RFC 6749 §3.3) a
+	// connector needs to request when it signs in against IssuerURL. Both
+	// discovery mechanisms RFC 9728 recognises advertise it once set: the
+	// WWW-Authenticate challenge's "scope" parameter (see
+	// Server.challenge) and the RFC 9728 metadata document's
+	// scopes_supported field (see Handler). Left empty — the default —
+	// neither is emitted and both stay exactly as they were before this
+	// field existed: no scope in the challenge, no scopes_supported in
+	// the document.
+	//
+	// Without it, a connector that only reads what gangway itself
+	// advertises has no way to learn which scope to request and falls
+	// back to whatever its own default is (often just "openid profile
+	// offline_access") — that request succeeds, the sign-in appears to
+	// complete, and the mismatch only surfaces later, at the first tool
+	// call, as a token rejected for the wrong audience. Naming the scope
+	// here lets the connector ask for the right one the first time.
+	RequiredScopes []string
 }
 
 // LoadConfig reads the environment.
@@ -133,6 +152,10 @@ func LoadConfig() (*Config, error) {
 		cfg.AllowWriteByDefault = b
 	}
 
+	if cfg.RequiredScopes, err = parseScopes("GANGWAY_REQUIRED_SCOPES", os.Getenv("GANGWAY_REQUIRED_SCOPES")); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
 }
 
@@ -165,6 +188,59 @@ func parsePrefixes(name, value string) ([]netip.Prefix, error) {
 			return nil, fmt.Errorf("gangway: %s: entry %d is not a CIDR prefix", name, i+1)
 		}
 		out = append(out, p)
+	}
+	return out, nil
+}
+
+// isValidScopeToken reports whether s is a syntactically valid OAuth 2.0
+// scope-token, as RFC 6749 §3.3 defines it:
+//
+//	scope-token = 1*( %x21 / %x23-5B / %x5D-7E )
+//
+// — one or more characters in the printable ASCII range %x21-7E, except
+// %x22 (the double quote) and %x5C (the backslash). That excludes space
+// along with the two characters, which matters here for a second reason
+// beyond spec conformance: parseScopes below and Server.challenge both
+// treat a RequiredScopes entry as a single token — split apart by commas
+// on the way in, rejoined with spaces on the way out (RFC 6750 §3's
+// space-delimited "scope" parameter) — so a space inside one entry would
+// silently turn one configured scope into two once a connector splits
+// that parameter back apart. A double quote would instead break the
+// quoted-string challenge wraps the joined list in.
+func isValidScopeToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x21 || r > 0x7E || r == 0x22 || r == 0x5C {
+			return false
+		}
+	}
+	return true
+}
+
+// parseScopes parses a comma-separated list of OAuth 2.0 scope values for
+// GANGWAY_REQUIRED_SCOPES, in the same comma-separated, whitespace- and
+// blank-entry-tolerant shape parsePrefixes accepts for the two CIDR-list
+// variables above. Unlike parsePrefixes, the error message here has
+// nothing sensitive to withhold — a scope name is not a secret — but it
+// still names only the position of the offending entry, not its text, for
+// consistency with every other rejection LoadConfig produces.
+func parseScopes(name, value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !isValidScopeToken(part) {
+			return nil, fmt.Errorf("gangway: %s: entry %d is not a valid OAuth 2.0 scope token", name, i+1)
+		}
+		out = append(out, part)
 	}
 	return out, nil
 }
