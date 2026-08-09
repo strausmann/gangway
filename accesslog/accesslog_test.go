@@ -36,6 +36,56 @@ func TestWritesCombinedFormat(t *testing.T) {
 	}
 }
 
+// TestUsesResolvedAddrOverRemoteAddr is the regression test for the
+// combined access log carrying a reverse proxy's own address instead of
+// the caller's: a middleware composed ahead of Middleware (see
+// origin.Gate / serve.Server.resolveClientAddr) that has already
+// determined the real caller — behind a trusted proxy chain, say — must
+// be able to make Middleware log that address instead of r.RemoteAddr,
+// which behind such a proxy is the proxy's own peer address, not the
+// caller's.
+func TestUsesResolvedAddrOverRemoteAddr(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "172.20.0.5:5000"                               // the proxy's own address
+	ctx := accesslog.WithResolvedAddr(r.Context(), "160.79.104.1") // the real caller
+	h.ServeHTTP(httptest.NewRecorder(), r.WithContext(ctx))
+
+	line := buf.String()
+	if !strings.Contains(line, `160.79.104.1 - - [`) {
+		t.Errorf("log line %q does not use the resolved address", line)
+	}
+	if strings.Contains(line, "172.20.0.5") {
+		t.Errorf("log line %q leaks the proxy's own address", line)
+	}
+}
+
+// TestFallsBackToRemoteAddrWithoutAResolvedAddr locks in the pre-existing
+// behaviour (TestWritesCombinedFormat) for a request that never passed
+// through anything calling WithResolvedAddr — a caller with no proxy in
+// front of it, or a package outside gangway reusing Middleware on its own.
+func TestFallsBackToRemoteAddrWithoutAResolvedAddr(t *testing.T) {
+	var buf bytes.Buffer
+
+	h := accesslog.Middleware(&buf)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	r.RemoteAddr = "160.79.104.1:5000"
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	line := buf.String()
+	if !strings.Contains(line, `160.79.104.1 - - [`) {
+		t.Errorf("log line %q does not fall back to RemoteAddr", line)
+	}
+}
+
 func TestRecordsRefusedToolCall(t *testing.T) {
 	var buf bytes.Buffer
 

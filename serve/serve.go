@@ -714,18 +714,22 @@ func (s *Server) toolMiddleware() mcp.Middleware {
 //
 // Order matters and is the point of this function:
 //
-//	access log        outermost, so every request is recorded — health
-//	                  checks and refusals alike
-//	  /healthz        exempt from the origin gate (see the route
+//	resolve address outermost of all, so every route — including
+//	                  /healthz — gets the caller's real address (see
+//	                  resolveClientAddr) resolved before anything below
+//	                  it runs
+//	  access log      so every request is recorded — health checks and
+//	                  refusals alike — carrying that resolved address
+//	    /healthz      exempt from the origin gate (see the route
 //	                  registration below); every other path continues
 //	                  through it
-//	    origin gate   before the body is read
-//	      authenticate before the MCP layer sees anything — but only for
-//	                  /mcp; the RFC 9728 metadata document is reachable
-//	                  without a token too (deliberately: see its route
-//	                  registration below), though still behind the
-//	                  origin gate, unlike /healthz
-//	        MCP handler tool authorization lives inside, in SDK
+//	      origin gate before the body is read
+//	        authenticate before the MCP layer sees anything — but only
+//	                  for /mcp; the RFC 9728 metadata document is
+//	                  reachable without a token too (deliberately: see
+//	                  its route registration below), though still behind
+//	                  the origin gate, unlike /healthz
+//	          MCP handler tool authorization lives inside, in SDK
 //	                  middleware installed by AttachMCP (see
 //	                  toolMiddleware)
 func (s *Server) Handler() http.Handler {
@@ -818,7 +822,74 @@ func (s *Server) Handler() http.Handler {
 	})
 	top.Handle("/", gate(mux))
 
-	return accesslog.Middleware(s.logs)(top)
+	// s.resolveClientAddr wraps accesslog.Middleware, not the other way
+	// round: see its own doc comment for why that ordering is what makes
+	// the resolved address actually reach the log line, for every route
+	// this Server serves — including /healthz, which origin.Gate itself
+	// never sees.
+	return s.resolveClientAddr(accesslog.Middleware(s.logs)(top))
+}
+
+// resolveClientAddr determines the caller's address exactly the way
+// origin.Gate does (see origin.ClientIP, driven by the same
+// s.cfg.HeaderMode and s.cfg.TrustedProxies Gate itself uses) and, when
+// that succeeds, attaches it to the request's context via
+// accesslog.WithResolvedAddr before dispatching to next.
+//
+// Composed here — outside (ahead of) accesslog.Middleware in Handler,
+// rather than relying on origin.Gate, deeper in the chain, to make the
+// address available — is what actually fixes the bug this method exists
+// for: the combined access log used to carry r.RemoteAddr verbatim, which
+// behind a reverse proxy is the proxy's own address, not the caller
+// origin.Gate had just resolved and judged. That address was never
+// reachable from accesslog.Middleware's own log line no matter where
+// inside Gate it was stored, because Gate operates on its own copy of the
+// request (http.Request.WithContext returns a new value each time it is
+// called) — a mutation made several layers inside Middleware's own
+// next.ServeHTTP call is invisible to the *http.Request Middleware itself
+// is holding as a local variable. Resolving the address here, in a
+// middleware composed strictly outside Middleware, sidesteps that
+// entirely: the address this method attaches becomes part of the very
+// *http.Request Middleware's own handler receives as its function
+// argument, the same way any other middleware wrapping another passes
+// state forward — no copy-visibility problem to work around, because
+// nothing here needs to be read back out of a deeper layer after the
+// fact (contrast accesslog.MarkToolOutcome, which solves that different,
+// harder problem for the MCP tool outcome, only knowable once the deeper
+// layer that reports it has already run).
+//
+// This intentionally does not replace origin.Gate's own call to
+// ClientIP — Gate keeps computing it independently, against the same
+// inputs, to decide whether the caller is allowed. Two consequences
+// follow from keeping them independent rather than sharing one cached
+// value: first, a caller origin.Gate goes on to refuse still gets its
+// real address recorded here, because this method runs unconditionally,
+// before Gate has had any chance to reject the request; second, /healthz
+// — deliberately exempt from origin.Gate itself (see the route
+// registration above), because a liveness or readiness probe runs from
+// an address that will never appear in a connector allowlist — is not
+// also exempt from having its own access-log line carry the real prober
+// address rather than a reverse proxy's, the same way every other route
+// does. Recomputing origin.ClientIP a second time inside Gate is a cheap,
+// deterministic function of the same request and configuration Gate
+// already needs regardless of whether this method ran first; sharing the
+// resolved value instead would only save that recomputation, at the cost
+// of a second, load-bearing coupling between two packages (accesslog and
+// origin) that otherwise do not need to know about each other at all.
+//
+// A peer address that fails to parse (see origin.ClientIP) is left
+// alone: nothing is attached to the context, and accesslog.Middleware
+// falls back to its own, more lenient resolution of r.RemoteAddr, the
+// same fallback it used before this method existed. origin.Gate
+// encounters and rejects that same caller on its own terms, deeper in
+// the chain, unaffected by this method's decision not to intervene here.
+func (s *Server) resolveClientAddr(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if addr, err := origin.ClientIP(r, s.cfg.HeaderMode, s.cfg.TrustedProxies); err == nil {
+			r = r.WithContext(accesslog.WithResolvedAddr(r.Context(), addr.String()))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authenticate verifies the bearer token and places the identity in the
