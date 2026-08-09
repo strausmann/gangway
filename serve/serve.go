@@ -761,6 +761,13 @@ func (s *Server) Handler() http.Handler {
 		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/") + mcpPath,
 		AuthorizationServers:   []string{s.cfg.IssuerURL},
 		BearerMethodsSupported: []string{"header"},
+		// nil when Config.RequiredScopes was never set — and
+		// oauthex.ProtectedResourceMetadata.ScopesSupported carries its
+		// own `json:"scopes_supported,omitempty"` tag, so a nil slice
+		// here means the field drops out of the document entirely,
+		// exactly as it did before this field existed. See challenge for
+		// the WWW-Authenticate half of the same advertisement.
+		ScopesSupported: s.cfg.RequiredScopes,
 	})
 	mux.Handle(wellKnownProtectedResourcePath, metadata)
 	mux.Handle(wellKnownProtectedResourcePathSpecific, metadata)
@@ -839,10 +846,25 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 // in. The public base URL is configured, never derived from headers —
 // otherwise a caller could redirect the sign-in flow to a server of its
 // own choosing.
+//
+// When Config.RequiredScopes is set, the challenge also carries a "scope"
+// auth-param (RFC 6750 §3): a space-delimited list, inside one
+// quoted-string, of every configured scope — not one param per scope,
+// which auth-param syntax does not allow. This is the discovery path a
+// connector reaches first, before it has ever seen the RFC 9728 metadata
+// document (see Handler's ScopesSupported field for that other half): a
+// connector that only reads what a 401 hands it directly still learns
+// which scope to request. LoadConfig already rejected any entry that
+// could not survive being embedded here unescaped — see
+// isValidScopeToken — so no further escaping happens at this point.
 func (s *Server) challenge(w http.ResponseWriter) {
-	w.Header().Set("WWW-Authenticate", fmt.Sprintf(
-		`Bearer resource_metadata="%s%s"`,
-		strings.TrimSuffix(s.cfg.PublicBaseURL, "/"), wellKnownProtectedResourcePath))
+	resourceMetadataURL := strings.TrimSuffix(s.cfg.PublicBaseURL, "/") + wellKnownProtectedResourcePath
+	value := `Bearer resource_metadata="` + resourceMetadataURL + `"`
+	if len(s.cfg.RequiredScopes) > 0 {
+		value = fmt.Sprintf(`Bearer scope="%s", resource_metadata="%s"`,
+			strings.Join(s.cfg.RequiredScopes, " "), resourceMetadataURL)
+	}
+	w.Header().Set("WWW-Authenticate", value)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 

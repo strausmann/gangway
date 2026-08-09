@@ -42,6 +42,47 @@ the values actually get used (building the OIDC verifier via
 not from `LoadConfig`. A caller who uses `WithVerifier` is not forced to
 set either.
 
+## Scope advertisement
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GANGWAY_REQUIRED_SCOPES` | Comma-separated OAuth 2.0 scope values a connector should request when signing in against `GANGWAY_ISSUER_URL`. | empty |
+
+Leaving this unset changes nothing: no server built before this variable
+existed advertised a scope, and none built without setting it does now.
+
+Set, it is advertised through both discovery paths [RFC
+9728](https://www.rfc-editor.org/rfc/rfc9728) recognises — a connector
+following either one learns the same list:
+
+- The `WWW-Authenticate` challenge a bare, unauthenticated request to
+  `/mcp` receives carries a `scope` auth-param
+  ([RFC 6750 §3](https://www.rfc-editor.org/rfc/rfc6750#section-3)): every
+  configured value, space-delimited, inside one quoted string —
+  `Bearer scope="mcp.access", resource_metadata="..."`, not one `scope`
+  parameter per value.
+- The RFC 9728 protected-resource metadata document — reachable at
+  `/.well-known/oauth-protected-resource` even before any request has
+  been made, for a connector that probes for it up front — carries the
+  same list under `scopes_supported`.
+
+Without either, a connector has no way to learn which scope this server
+needs. It falls back to whatever it asks for by default — often just
+`openid profile offline_access` — the sign-in flow completes normally,
+and the mismatch only surfaces at the first tool call, as a token
+rejected for the wrong audience: a failure mode that looks like a broken
+server, not a missing scope.
+
+Each entry must be a single RFC 6749 §3.3 scope-token — in practice,
+anything without a literal space, double quote, or backslash in it.
+`LoadConfig` rejects anything else at startup, naming the offending
+variable and the position of the bad entry, never the entry's own text.
+A space would silently turn one configured scope into two once a
+connector splits the challenge's `scope` parameter back apart by
+whitespace, as the wire format requires; a double quote would instead
+terminate that parameter's quoted string early and corrupt the header for
+every caller.
+
 ## The allowlist: one of these two, at least
 
 | Variable | Purpose | Example |
