@@ -46,6 +46,43 @@ from the v1.0 endpoint carry a differently shaped `aud` (the bare client
 ID rather than the Application ID URI) and issuer, so issuer and audience
 have to be a matched pair from the same token version.
 
+## Advertising the scope: `AADSTS650053`
+
+A connector that only knows to follow gangway's own discovery — the
+`WWW-Authenticate` challenge's `scope` parameter, or the RFC 9728
+metadata document's `scopes_supported` — needs to be told which scope to
+request (see [Scope advertisement](../configuration.md#scope-advertisement)).
+For Entra, that value is **not** the bare scope name from the previous
+section. Advertising `mcp.access` on its own produces this at sign-in:
+
+```
+AADSTS650053: The application asked for scope 'mcp.access' that doesn't
+exist on the resource 'Microsoft Graph'.
+```
+
+A scope with no resource prefix resolves against Entra's default
+resource — Microsoft Graph — not this server's own application. What
+Entra actually requires a connector to request is the fully qualified
+form from step 3 above: `api://<client-id>/mcp.access`. The token that
+comes back, however, still carries only the short name `mcp.access` in
+its `scp` claim — the two are genuinely different strings, not two
+notations for the same value.
+
+Gangway models that split with two separate variables — set both for an
+Entra deployment:
+
+```bash
+GANGWAY_REQUIRED_SCOPES=mcp.access
+GANGWAY_ADVERTISED_SCOPES=api://<client-id>/mcp.access
+```
+
+`GANGWAY_ADVERTISED_SCOPES` is what gets sent out in both discovery
+paths; `GANGWAY_REQUIRED_SCOPES` keeps meaning what it always has. See
+[`GANGWAY_ADVERTISED_SCOPES`](../configuration.md#gangway_advertised_scopes-when-what-you-request-isnt-what-you-get-back)
+for the full explanation — Entra is the reason that variable exists in
+the first place; every other provider this project has checked uses the
+same short name on both ends and never needs it.
+
 ## Why `GANGWAY_SUBJECT_CLAIM=oid`, not `sub`
 
 Leave `GANGWAY_SUBJECT_CLAIM` at Gangway's default (`sub`) for most OIDC

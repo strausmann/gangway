@@ -83,6 +83,47 @@ whitespace, as the wire format requires; a double quote would instead
 terminate that parameter's quoted string early and corrupt the header for
 every caller.
 
+### `GANGWAY_ADVERTISED_SCOPES`: when what you request isn't what you get back
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GANGWAY_ADVERTISED_SCOPES` | Comma-separated OAuth 2.0 scope values to advertise instead of `GANGWAY_REQUIRED_SCOPES`, in both discovery paths above. Same syntax and validation as `GANGWAY_REQUIRED_SCOPES`. | empty — falls back to `GANGWAY_REQUIRED_SCOPES` |
+
+Neither RFC 9728 nor RFC 6749/6750 says whether a scope must be advertised
+under its bare name or some fully qualified form — that choice belongs to
+the authorization server. Most providers this project has been checked
+against (Authentik, Keycloak, Auth0, Okta, and Cloudflare's own OAuth
+provider) use the same short name both when a connector requests it and
+in the token's `scp` claim afterwards, so `GANGWAY_REQUIRED_SCOPES` alone
+covers them.
+
+**Microsoft Entra ID does not.** Requesting a bare scope name there fails
+at sign-in with `AADSTS650053` ("the application asked for scope
+'mcp.access' that doesn't exist on the resource 'Microsoft Graph'") — a
+name with no resource prefix resolves against the Microsoft Graph default
+resource, not your own application. What Entra requires on the
+request/advertisement side is the fully qualified
+`api://<Application-ID-URI>/<scope-name>` form (see [Azure App Service's
+`WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES`
+setting](https://learn.microsoft.com/en-us/azure/app-service/configure-authentication-mcp-server-vscode)
+for an example of the same shape), while the token's `scp` claim still
+carries only the short name afterwards.
+
+Set both variables for an Entra deployment — `GANGWAY_REQUIRED_SCOPES` to
+the short name, `GANGWAY_ADVERTISED_SCOPES` to the fully qualified
+`api://` form — and gangway advertises the qualified form while nothing
+else changes:
+
+```
+GANGWAY_REQUIRED_SCOPES=mcp.access
+GANGWAY_ADVERTISED_SCOPES=api://11111111-2222-3333-4444-555555555555/mcp.access
+```
+
+Leaving `GANGWAY_ADVERTISED_SCOPES` unset — the default, and every
+deployment's setting before this variable existed — changes nothing:
+both discovery paths fall back to advertising `GANGWAY_REQUIRED_SCOPES`,
+exactly as they did before this variable existed.
+
 ## The allowlist: one of these two, at least
 
 | Variable | Purpose | Example |
