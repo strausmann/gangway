@@ -73,7 +73,49 @@ type Config struct {
 	// complete, and the mismatch only surfaces later, at the first tool
 	// call, as a token rejected for the wrong audience. Naming the scope
 	// here lets the connector ask for the right one the first time.
+	//
+	// Every provider gangway has been deployed against so far — including
+	// Authentik — uses this same short form on both ends: what a
+	// connector requests and what ends up in the token's "scp" claim are
+	// identical. Microsoft Entra ID is a documented exception (see
+	// AdvertisedScopes below); RequiredScopes keeps meaning exactly what
+	// it always has, because every other provider still needs it to.
 	RequiredScopes []string
+
+	// AdvertisedScopes, when set, overrides what the WWW-Authenticate
+	// challenge's "scope" parameter (see Server.challenge) and the RFC
+	// 9728 metadata document's scopes_supported field (see Handler)
+	// advertise — RequiredScopes itself is untouched and keeps meaning
+	// what its own doc comment says.
+	//
+	// This exists because the two are not always the same value. Entra ID
+	// rejects a bare scope name in a token request with AADSTS650053 ("the
+	// application asked for scope 'mcp.access' that doesn't exist on the
+	// resource 'Microsoft Graph'") — a name with no resource prefix
+	// resolves against the Microsoft Graph default resource, not this
+	// server's own application. What Entra requires on the
+	// request/advertisement side is the fully qualified
+	// "api://<Application-ID-URI>/<scope-name>" form (see
+	// https://learn.microsoft.com/en-us/azure/app-service/configure-authentication-mcp-server-vscode,
+	// the WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES setting), while the short
+	// name is still what shows up in the token's "scp" claim afterwards.
+	// Neither RFC 9728 nor RFC 6749/6750 mandates either shape — that is
+	// squarely the authorization server's choice, and Entra's choice here
+	// is the outlier among the providers this project has checked
+	// (Authentik, Keycloak, Auth0, Okta and Cloudflare's OAuth provider
+	// all use the same short name on both ends). A single field trying to
+	// serve both purposes can only be correct for one kind of provider at
+	// a time; this field exists so it does not have to choose.
+	//
+	// Left empty — the default, and the only value every deployment
+	// before this field existed ever had — both the challenge and the
+	// metadata document fall back to advertising RequiredScopes, exactly
+	// as they did before this field existed. Setting it changes nothing
+	// about what gangway itself checks: nothing in this package verifies
+	// a token's "scp" claim against either field today (see RequiredScopes'
+	// own value, unchanged, for what — if anything — a future check would
+	// use).
+	AdvertisedScopes []string
 }
 
 // LoadConfig reads the environment.
@@ -153,6 +195,10 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if cfg.RequiredScopes, err = parseScopes("GANGWAY_REQUIRED_SCOPES", os.Getenv("GANGWAY_REQUIRED_SCOPES")); err != nil {
+		return nil, err
+	}
+
+	if cfg.AdvertisedScopes, err = parseScopes("GANGWAY_ADVERTISED_SCOPES", os.Getenv("GANGWAY_ADVERTISED_SCOPES")); err != nil {
 		return nil, err
 	}
 

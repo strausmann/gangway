@@ -399,6 +399,114 @@ func TestLoadConfigAcceptsARequiredScopeWithURNStyleColonsAndSlashes(t *testing.
 	}
 }
 
+// --- GANGWAY_ADVERTISED_SCOPES ---
+
+func TestLoadConfigDefaultsAdvertisedScopesToEmpty(t *testing.T) {
+	setMinimalEnv(t)
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(cfg.AdvertisedScopes) != 0 {
+		t.Errorf("AdvertisedScopes = %v, want none", cfg.AdvertisedScopes)
+	}
+}
+
+func TestLoadConfigParsesAdvertisedScopes(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", "api://11111111-2222-3333-4444-555555555555/mcp.access")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"api://11111111-2222-3333-4444-555555555555/mcp.access"}
+	if !slices.Equal(cfg.AdvertisedScopes, want) {
+		t.Errorf("AdvertisedScopes = %v, want %v", cfg.AdvertisedScopes, want)
+	}
+}
+
+func TestLoadConfigParsesMultipleAdvertisedScopesWithWhitespaceAndBlanks(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", " api://app-id/mcp.access , ,api://app-id/offline_access")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"api://app-id/mcp.access", "api://app-id/offline_access"}
+	if !slices.Equal(cfg.AdvertisedScopes, want) {
+		t.Errorf("AdvertisedScopes = %v, want %v", cfg.AdvertisedScopes, want)
+	}
+}
+
+// TestLoadConfigRefusesAdvertisedScopeContainingASpace mirrors
+// TestLoadConfigRefusesRequiredScopeContainingASpace: AdvertisedScopes goes
+// through the identical isValidScopeToken check RequiredScopes does, and
+// Server.challenge joins it with a single space the same way — an entry
+// that itself contained a space would silently turn one configured scope
+// into two once a connector splits the "scope" auth-param back apart.
+func TestLoadConfigRefusesAdvertisedScopeContainingASpace(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", "api://app-id/mcp access")
+
+	_, err := serve.LoadConfig()
+	if err == nil {
+		t.Fatal("want an error for an advertised scope containing a space, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_ADVERTISED_SCOPES") {
+		t.Errorf("error %q does not name the offending variable", err)
+	}
+}
+
+// TestLoadConfigRefusesAdvertisedScopeContainingADoubleQuote mirrors
+// TestLoadConfigRefusesRequiredScopeContainingADoubleQuote: the challenge
+// wraps AdvertisedScopes in a quoted-string the same way it does
+// RequiredScopes, so an unescaped double quote would corrupt the
+// WWW-Authenticate header the same way.
+func TestLoadConfigRefusesAdvertisedScopeContainingADoubleQuote(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", `api://app-id/mcp."access`)
+
+	_, err := serve.LoadConfig()
+	if err == nil {
+		t.Fatal("want an error for an advertised scope containing a double quote, got none")
+	}
+	if !strings.Contains(err.Error(), "GANGWAY_ADVERTISED_SCOPES") {
+		t.Errorf("error %q does not name the offending variable", err)
+	}
+}
+
+// TestLoadConfigAcceptsAFullyQualifiedEntraStyleAdvertisedScope is the
+// reason AdvertisedScopes exists at all: Entra ID rejects a bare scope
+// name like "mcp.access" in a token request with AADSTS650053 ("scope ...
+// that doesn't exist on the resource 'Microsoft Graph'") because a name
+// without a resource prefix resolves against Graph, not this server's own
+// application. What must be requested/advertised there is the fully
+// qualified "api://<Application-ID-URI>/<scope-name>" form (see
+// https://learn.microsoft.com/en-us/azure/app-service/configure-authentication-mcp-server-vscode,
+// WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES) while the token's "scp" claim still
+// carries only the short name — the exact split AdvertisedScopes and
+// RequiredScopes now model. isValidScopeToken already allows ":" and "/"
+// (see TestLoadConfigAcceptsARequiredScopeWithURNStyleColonsAndSlashes for
+// the same boundary on RequiredScopes); this test pins the specific
+// Entra-shaped value down so a future change to that boundary cannot
+// silently break it.
+func TestLoadConfigAcceptsAFullyQualifiedEntraStyleAdvertisedScope(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", "api://11111111-2222-3333-4444-555555555555/mcp.access")
+
+	cfg, err := serve.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"api://11111111-2222-3333-4444-555555555555/mcp.access"}
+	if !slices.Equal(cfg.AdvertisedScopes, want) {
+		t.Errorf("AdvertisedScopes = %v, want %v", cfg.AdvertisedScopes, want)
+	}
+}
+
 func TestLoadConfigCarriesWritersClaimAndValue(t *testing.T) {
 	setMinimalEnv(t)
 	t.Setenv("GANGWAY_WRITERS_CLAIM", "groups")
@@ -464,6 +572,12 @@ func TestLoadConfigErrorsNeverContainTheOffendingValue(t *testing.T) {
 			env:    "GANGWAY_REQUIRED_SCOPES",
 			value:  "not a valid scope-7b6a5c4d",
 			secret: "7b6a5c4d",
+		},
+		{
+			name:   "invalid advertised scope",
+			env:    "GANGWAY_ADVERTISED_SCOPES",
+			value:  "not a valid scope-3e2d1c0b",
+			secret: "3e2d1c0b",
 		},
 	}
 

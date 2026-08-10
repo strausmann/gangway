@@ -1826,6 +1826,109 @@ func TestMetadataDocumentOmitsScopesSupportedFieldWhenNotConfigured(t *testing.T
 	}
 }
 
+// --- GANGWAY_ADVERTISED_SCOPES: advertised vs. required scopes ---
+
+// TestChallengeAdvertisesAdvertisedScopeInsteadOfRequiredScopeWhenBothConfigured
+// is the core regression test for this task's split: an Entra deployment
+// sets GANGWAY_REQUIRED_SCOPES to the short "scp"-claim form the token
+// actually carries (see the RequiredScopes field's own doc comment) and
+// GANGWAY_ADVERTISED_SCOPES to the fully qualified "api://<app-id>/<name>"
+// form Entra requires on the request/advertisement side (AADSTS650053
+// otherwise — see TestLoadConfigAcceptsAFullyQualifiedEntraStyleAdvertisedScope).
+// The two values are deliberately different here so a bug that advertised
+// RequiredScopes instead, or mixed the two, would be caught: the challenge
+// must carry only the AdvertisedScopes value.
+func TestChallengeAdvertisesAdvertisedScopeInsteadOfRequiredScopeWhenBothConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access")
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", "api://11111111-2222-3333-4444-555555555555/mcp.access")
+	h := newServer(t, idp, &logs)
+
+	w := request(t, h, "172.20.0.5:5000", "160.79.104.1", "")
+
+	challenge := w.Header().Get("WWW-Authenticate")
+	want := `scope="api://11111111-2222-3333-4444-555555555555/mcp.access"`
+	if !strings.Contains(challenge, want) {
+		t.Errorf("WWW-Authenticate = %q, want it to contain %s", challenge, want)
+	}
+	if strings.Contains(challenge, `scope="mcp.access"`) {
+		t.Errorf("WWW-Authenticate = %q, must not advertise the bare RequiredScopes value once AdvertisedScopes is configured", challenge)
+	}
+}
+
+// TestChallengeFallsBackToRequiredScopesWhenAdvertisedScopesNotConfigured is
+// the regression test that makes the fallback the point of this task:
+// every existing deployment sets only GANGWAY_REQUIRED_SCOPES (Authentik,
+// which uses short scope names on both the request and the "scp" claim —
+// see the HomeLab's pangolin-resource-standard for that provider) and must
+// see byte-for-byte the same WWW-Authenticate value it saw before
+// AdvertisedScopes existed.
+func TestChallengeFallsBackToRequiredScopesWhenAdvertisedScopesNotConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access,offline_access")
+	h := newServer(t, idp, &logs) // GANGWAY_ADVERTISED_SCOPES deliberately left unset
+
+	w := request(t, h, "172.20.0.5:5000", "160.79.104.1", "")
+
+	challenge := w.Header().Get("WWW-Authenticate")
+	if !strings.Contains(challenge, `scope="mcp.access offline_access"`) {
+		t.Errorf(`WWW-Authenticate = %q, want scope="mcp.access offline_access" (unchanged fallback to RequiredScopes)`, challenge)
+	}
+}
+
+// TestMetadataDocumentAdvertisesAdvertisedScopeInsteadOfRequiredScopeWhenBothConfigured
+// is the RFC 9728 discovery-document half of
+// TestChallengeAdvertisesAdvertisedScopeInsteadOfRequiredScopeWhenBothConfigured
+// — scopes_supported must carry the same AdvertisedScopes value the
+// WWW-Authenticate challenge does, not RequiredScopes.
+func TestMetadataDocumentAdvertisesAdvertisedScopeInsteadOfRequiredScopeWhenBothConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access")
+	t.Setenv("GANGWAY_ADVERTISED_SCOPES", "api://11111111-2222-3333-4444-555555555555/mcp.access")
+	h := newServer(t, idp, &logs)
+
+	resp, body := metadataRequest(t, h, wellKnownProtectedResourcePath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", wellKnownProtectedResourcePath, resp.StatusCode, http.StatusOK)
+	}
+
+	var doc oauthex.ProtectedResourceMetadata
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("metadata document is not valid JSON: %v", err)
+	}
+	want := []string{"api://11111111-2222-3333-4444-555555555555/mcp.access"}
+	if !slices.Equal(doc.ScopesSupported, want) {
+		t.Errorf("ScopesSupported = %v, want %v", doc.ScopesSupported, want)
+	}
+}
+
+// TestMetadataDocumentFallsBackToRequiredScopesWhenAdvertisedScopesNotConfigured
+// is the discovery-document half of
+// TestChallengeFallsBackToRequiredScopesWhenAdvertisedScopesNotConfigured.
+func TestMetadataDocumentFallsBackToRequiredScopesWhenAdvertisedScopesNotConfigured(t *testing.T) {
+	idp := testidp.New(t)
+	var logs syncBuffer
+	t.Setenv("GANGWAY_REQUIRED_SCOPES", "mcp.access,offline_access")
+	h := newServer(t, idp, &logs) // GANGWAY_ADVERTISED_SCOPES deliberately left unset
+
+	resp, body := metadataRequest(t, h, wellKnownProtectedResourcePath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want %d", wellKnownProtectedResourcePath, resp.StatusCode, http.StatusOK)
+	}
+
+	var doc oauthex.ProtectedResourceMetadata
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("metadata document is not valid JSON: %v", err)
+	}
+	want := []string{"mcp.access", "offline_access"}
+	if !slices.Equal(doc.ScopesSupported, want) {
+		t.Errorf("ScopesSupported = %v, want %v (unchanged fallback to RequiredScopes)", doc.ScopesSupported, want)
+	}
+}
+
 // --- WithLogWriter: the writer need not be safe for concurrent use ---
 
 // TestLogWriterNeedNotBeConcurrencySafe reproduces the review finding
