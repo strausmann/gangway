@@ -765,13 +765,16 @@ func (s *Server) Handler() http.Handler {
 		Resource:               strings.TrimSuffix(s.cfg.PublicBaseURL, "/") + mcpPath,
 		AuthorizationServers:   []string{s.cfg.IssuerURL},
 		BearerMethodsSupported: []string{"header"},
-		// nil when Config.RequiredScopes was never set — and
-		// oauthex.ProtectedResourceMetadata.ScopesSupported carries its
-		// own `json:"scopes_supported,omitempty"` tag, so a nil slice
-		// here means the field drops out of the document entirely,
-		// exactly as it did before this field existed. See challenge for
-		// the WWW-Authenticate half of the same advertisement.
-		ScopesSupported: s.cfg.RequiredScopes,
+		// advertisedScopes returns Config.AdvertisedScopes when set, else
+		// falls back to Config.RequiredScopes — nil when neither was ever
+		// set, and oauthex.ProtectedResourceMetadata.ScopesSupported
+		// carries its own `json:"scopes_supported,omitempty"` tag, so a
+		// nil slice here means the field drops out of the document
+		// entirely, exactly as it did before either field existed. See
+		// challenge for the WWW-Authenticate half of the same
+		// advertisement, and advertisedScopes' own doc comment for why
+		// the two configuration fields are not simply one.
+		ScopesSupported: s.advertisedScopes(),
 	})
 	mux.Handle(wellKnownProtectedResourcePath, metadata)
 	mux.Handle(wellKnownProtectedResourcePathSpecific, metadata)
@@ -918,8 +921,8 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 // otherwise a caller could redirect the sign-in flow to a server of its
 // own choosing.
 //
-// When Config.RequiredScopes is set, the challenge also carries a "scope"
-// auth-param (RFC 6750 §3): a space-delimited list, inside one
+// When advertisedScopes returns anything, the challenge also carries a
+// "scope" auth-param (RFC 6750 §3): a space-delimited list, inside one
 // quoted-string, of every configured scope — not one param per scope,
 // which auth-param syntax does not allow. This is the discovery path a
 // connector reaches first, before it has ever seen the RFC 9728 metadata
@@ -931,12 +934,32 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 func (s *Server) challenge(w http.ResponseWriter) {
 	resourceMetadataURL := strings.TrimSuffix(s.cfg.PublicBaseURL, "/") + wellKnownProtectedResourcePath
 	value := `Bearer resource_metadata="` + resourceMetadataURL + `"`
-	if len(s.cfg.RequiredScopes) > 0 {
+	if scopes := s.advertisedScopes(); len(scopes) > 0 {
 		value = fmt.Sprintf(`Bearer scope="%s", resource_metadata="%s"`,
-			strings.Join(s.cfg.RequiredScopes, " "), resourceMetadataURL)
+			strings.Join(scopes, " "), resourceMetadataURL)
 	}
 	w.Header().Set("WWW-Authenticate", value)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// advertisedScopes returns what the WWW-Authenticate challenge's "scope"
+// auth-param and the RFC 9728 metadata document's scopes_supported field
+// advertise: Config.AdvertisedScopes when it was set, otherwise
+// Config.RequiredScopes — nil when neither was ever set, which keeps both
+// advertisements exactly as they were before AdvertisedScopes existed.
+//
+// The two configuration fields are not simply one because what gets
+// advertised and what a provider puts in a verified token's "scp" claim
+// are not always the same value — see Config.AdvertisedScopes' own doc
+// comment for the concrete case (Microsoft Entra ID's AADSTS650053) that
+// makes them diverge. This method is the one place that resolves the
+// fallback, so Handler and challenge cannot drift from each other on how
+// they do it.
+func (s *Server) advertisedScopes() []string {
+	if len(s.cfg.AdvertisedScopes) > 0 {
+		return s.cfg.AdvertisedScopes
+	}
+	return s.cfg.RequiredScopes
 }
 
 type identityKey struct{}
